@@ -1,5 +1,9 @@
 const std = @import("std");
 
+const c = @cImport({
+    @cInclude("wctype.h");
+});
+
 pub fn main() !void {
     var wc_fn = &wc_dfa;
     var args = std.process.args();
@@ -11,7 +15,6 @@ pub fn main() !void {
     };
     var processed_files: usize = 0;
     while (args.next()) |arg| {
-        std.debug.print("Processing file: {s}\n", .{arg});
         if (std.mem.eql(u8, arg, "--ref")) {
             wc_fn = &wc_ref;
             continue;
@@ -77,7 +80,6 @@ pub fn gen_transition_table() [4][3]u8 {
 }
 
 fn gen_char_type_table() [256]u8 {
-    // Default to character
     var column: [256]u8 = [_]u8{Type.character} ** 256;
     for (0..256) |b| {
         if (std.ascii.isWhitespace(@intCast(b))) {
@@ -95,7 +97,7 @@ pub fn wc_dfa(reader: *std.Io.Reader) Result {
     const column = comptime gen_char_type_table();
 
     var counts = [4]usize{ 0, 0, 0, 0 };
-    var state: usize = 0;
+    var state: usize = State.whitespace;
     while (true) {
         const b = reader.takeByte() catch break;
         state = table[state][column[b]];
@@ -116,9 +118,29 @@ pub fn wc_ref(reader: *std.Io.Reader) Result {
     var in_word: bool = false;
 
     while (true) {
-        const b = reader.takeByte() catch break;
+        const len = std.unicode.utf8ByteSequenceLength(reader.peekByte() catch break) catch unreachable;
+        var ch: u21 = 0;
+        switch (len) {
+            1 => {
+                const b = reader.takeByte() catch unreachable;
+                ch = @as(u21, b);
+            },
+            2 => {
+                const buf = reader.takeArray(2) catch unreachable;
+                ch = std.unicode.utf8Decode2(buf.*) catch unreachable;
+            },
+            3 => {
+                const buf = reader.takeArray(3) catch unreachable;
+                ch = std.unicode.utf8Decode3(buf.*) catch unreachable;
+            },
+            4 => {
+                const buf = reader.takeArray(4) catch unreachable;
+                ch = std.unicode.utf8Decode4(buf.*) catch unreachable;
+            },
+            else => break,
+        }
         byte_count += 1;
-        switch (b) {
+        switch (ch) {
             '\n' => {
                 line_count += 1;
                 in_word = false;
@@ -127,7 +149,7 @@ pub fn wc_ref(reader: *std.Io.Reader) Result {
                 in_word = false;
             },
             else => {
-                const in_word2 = !std.ascii.isWhitespace(b);
+                const in_word2 = c.iswspace(@as(c.wint_t, ch)) == 0;
                 if (in_word2 and !in_word) {
                     word_count += 1;
                 }
