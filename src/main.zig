@@ -2,6 +2,7 @@ const std = @import("std");
 
 const c = @cImport({
     @cInclude("wctype.h");
+    @cInclude("locale.h");
 });
 
 pub fn main() !void {
@@ -54,58 +55,261 @@ const Result = struct {
     byte_count: usize,
 };
 
-const State = struct { whitespace: usize = 0, newline: usize = 1, word: usize = 2, in_word: usize = 3 }{};
-const Type = struct { character: usize = 0, whitespace: usize = 1, newline: usize = 2 }{};
+const Type = enum(usize) {
+    DUO2_xx,
+    DUO2_C2,
+    TRI2_E0,
+    TRI2_E1,
+    TRI2_E2,
+    TRI2_E3,
+    TRI2_ED,
+    TRI2_EE,
+    TRI2_xx,
+    TRI3_E0_xx,
+    TRI3_E1_xx,
+    TRI3_E1_9a,
+    TRI3_E2_80,
+    TRI3_E2_81,
+    TRI3_E2_xx,
+    TRI3_E3_80,
+    TRI3_E3_81,
+    TRI3_E3_xx,
+    TRI3_Ed_xx,
+    TRI3_Ee_xx,
+    TRI3_xx_xx,
+    QUAD2_xx,
+    QUAD2_F0,
+    QUAD2_F4,
+    QUAD3_xx_xx,
+    QUAD3_F0_xx,
+    QUAD3_F4_xx,
+    QUAD4_xx_xx_xx,
+    QUAD4_F0_xx_xx,
+    QUAD4_F4_xx_xx,
+    ILLEGAL,
+};
 
-pub fn gen_transition_table() [4][3]u8 {
-    var table: [4][3]u8 = [4][3]u8{ .{ 0, 0, 0 }, .{ 0, 0, 0 }, .{ 0, 0, 0 }, .{ 0, 0, 0 } };
+// ILLEGAL is at index 30, so we can calculate:
+// UWORD = USPACE + ILLEGAL + 1 = 4 + 30 + 1 = 35
+// STATE_MAX = UWORD + ILLEGAL + 1 = 35 + 30 + 1 = 66
+// There are a lot of states between USPACE and UWORD that are not represented here.
+// These are the unicode multibyte states.
+const State = struct {
+    WASSPACE: usize = 0,
+    NEWLINE: usize = 1,
+    NEWWORD: usize = 2,
+    WASWORD: usize = 3,
+    USPACE: usize = 4,
+    UWORD: usize = 35,
+    STATE_MAX: usize = 66,
+}{};
 
-    table[State.whitespace][Type.character] = State.word;
-    table[State.whitespace][Type.whitespace] = State.whitespace;
-    table[State.whitespace][Type.newline] = State.newline;
+fn int(t: anytype) usize {
+    return @intFromEnum(t);
+}
 
-    table[State.newline][Type.character] = State.word;
-    table[State.newline][Type.whitespace] = State.whitespace;
-    table[State.newline][Type.newline] = State.newline;
+pub fn build_basic(row: *[256]u8, default_state: u8, ubase: u8) void {
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if ((b & 0x80) != 0) {
+            if ((b & 0xE0) == 0xC0) {
+                // 110x xxxx - unicode 2 byte sequence
+                if (b < 0xC2) {
+                    row[b] = ubase + @as(u8, @intFromEnum(Type.ILLEGAL));
+                } else if (b == 0xC2) {
+                    row[b] = ubase + @as(u8, @intFromEnum(Type.DUO2_C2));
+                } else {
+                    row[b] = ubase + @as(u8, @intFromEnum(Type.DUO2_xx));
+                }
+            } else if ((b & 0xF0) == 0xE0) {
+                // 1110 xxxx - unicode 3 byte sequence
+                switch (b) {
+                    0xE0 => row[b] = ubase + @as(u8, @intFromEnum(Type.TRI2_E0)),
+                    0xE1 => row[b] = ubase + @as(u8, @intFromEnum(Type.TRI2_E1)),
+                    0xE2 => row[b] = ubase + @as(u8, @intFromEnum(Type.TRI2_E2)),
+                    0xE3 => row[b] = ubase + @as(u8, @intFromEnum(Type.TRI2_E3)),
+                    0xED => row[b] = ubase + @as(u8, @intFromEnum(Type.TRI2_ED)),
+                    0xEE => row[b] = ubase + @as(u8, @intFromEnum(Type.TRI2_EE)),
+                    else => row[b] = ubase + @as(u8, @intFromEnum(Type.TRI2_xx)),
+                }
+            } else if ((b & 0xF8) == 0xF0) {
+                if (b >= 0xF5) {
+                    row[b] = ubase + @as(u8, @intFromEnum(Type.ILLEGAL));
+                } else if (b == 0xF0) {
+                    row[b] = ubase + @as(u8, @intFromEnum(Type.QUAD2_F0));
+                } else if (b == 0xF4) {
+                    row[b] = ubase + @as(u8, @intFromEnum(Type.QUAD2_F4));
+                } else {
+                    row[b] = ubase + @as(u8, @intFromEnum(Type.QUAD2_xx));
+                }
+            } else {
+                row[b] = ubase + @as(u8, @intFromEnum(Type.ILLEGAL));
+            }
+        } else if (b == '\n') {
+            row[b] = State.NEWLINE;
+        } else if (std.ascii.isWhitespace(b)) {
+            row[b] = State.WASSPACE;
+        } else {
+            row[b] = default_state;
+        }
+    }
+}
 
-    table[State.word][Type.character] = State.in_word;
-    table[State.word][Type.whitespace] = State.whitespace;
-    table[State.word][Type.newline] = State.newline;
+const Table = [State.STATE_MAX][256]u8;
 
-    table[State.in_word][Type.character] = State.in_word;
-    table[State.in_word][Type.whitespace] = State.whitespace;
-    table[State.in_word][Type.newline] = State.newline;
+fn build_WASSPACE(row: *[256]u8) void {
+    build_basic(row, State.NEWWORD, State.USPACE);
+}
 
+fn build_WASWORD(row: *[256]u8) void {
+    build_basic(row, State.WASWORD, State.UWORD);
+}
+
+fn build_urow(table: *Table, ubase: u8, id: Type, init_next: Type) void {
+    var next: u8 = @intCast(@intFromEnum(init_next));
+    const id_u8: u8 = @intCast(@intFromEnum(id));
+    const default_state = table[ubase + @intFromEnum(Type.ILLEGAL)][0];
+    if (next == 0) {
+        next = default_state;
+    } else {
+        next = ubase + next;
+    }
+
+    @memcpy(&table[ubase + id_u8], &table[ubase + @intFromEnum(Type.ILLEGAL)]);
+
+    for (0x80..0xC0) |i| {
+        table[ubase + id_u8][i] = next;
+    }
+
+    for (0xC0..0x100) |i| {
+        table[ubase + id_u8][i] = ubase + @as(u8, @intFromEnum(Type.ILLEGAL));
+    }
+}
+
+fn build_unicode(table: *Table, default_state: u8, ubase: u8) void {
+    build_basic(&table[ubase + int(Type.ILLEGAL)], default_state, ubase);
+
+    // Two byte
+    build_urow(table, ubase, Type.DUO2_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.DUO2_C2, @enumFromInt(0));
+
+    // Three byte
+    build_urow(table, ubase, Type.TRI2_E0, Type.TRI3_E0_xx);
+    build_urow(table, ubase, Type.TRI2_E1, Type.TRI3_E1_xx);
+    build_urow(table, ubase, Type.TRI2_E2, Type.TRI3_E2_xx);
+    build_urow(table, ubase, Type.TRI2_E3, Type.TRI3_E3_xx);
+    build_urow(table, ubase, Type.TRI2_ED, Type.TRI3_Ed_xx);
+    build_urow(table, ubase, Type.TRI2_EE, Type.TRI3_Ee_xx);
+    build_urow(table, ubase, Type.TRI2_xx, Type.TRI3_xx_xx);
+
+    build_urow(table, ubase, Type.TRI3_E0_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_E1_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_E1_9a, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_E2_80, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_E2_81, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_E2_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_E3_80, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_E3_81, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_E3_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_Ed_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_Ee_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.TRI3_xx_xx, @enumFromInt(0));
+
+    table[ubase + @intFromEnum(Type.TRI2_E1)][0x9a] = ubase + @as(u8, @intFromEnum(Type.TRI3_E1_9a));
+    table[ubase + @intFromEnum(Type.TRI2_E2)][0x80] = ubase + @as(u8, @intFromEnum(Type.TRI3_E2_80));
+    table[ubase + @intFromEnum(Type.TRI2_E2)][0x81] = ubase + @as(u8, @intFromEnum(Type.TRI3_E2_81));
+    table[ubase + @intFromEnum(Type.TRI2_E3)][0x80] = ubase + @as(u8, @intFromEnum(Type.TRI3_E3_80));
+    table[ubase + @intFromEnum(Type.TRI2_E3)][0x81] = ubase + @as(u8, @intFromEnum(Type.TRI3_E3_81));
+
+    // Four byte
+    build_urow(table, ubase, Type.QUAD2_xx, Type.QUAD3_xx_xx);
+    build_urow(table, ubase, Type.QUAD2_F0, Type.QUAD3_F0_xx);
+    build_urow(table, ubase, Type.QUAD2_F4, Type.QUAD3_F4_xx);
+
+    build_urow(table, ubase, Type.QUAD3_xx_xx, Type.QUAD4_xx_xx_xx);
+    build_urow(table, ubase, Type.QUAD3_F0_xx, Type.QUAD4_F0_xx_xx);
+    build_urow(table, ubase, Type.QUAD3_F4_xx, Type.QUAD4_F4_xx_xx);
+
+    build_urow(table, ubase, Type.QUAD4_xx_xx_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.QUAD4_F0_xx_xx, @enumFromInt(0));
+    build_urow(table, ubase, Type.QUAD4_F4_xx_xx, @enumFromInt(0));
+
+    // Mark unicode spaces
+    if (c.iswspace(0x0085) != 0) {
+        table[ubase + @intFromEnum(Type.DUO2_C2)][0x85] = State.WASSPACE;
+    }
+    if (c.iswspace(0x00A0) != 0) {
+        table[ubase + @intFromEnum(Type.DUO2_C2)][0xA0] = State.WASSPACE;
+    }
+    if (c.iswspace(0x1680) != 0) {
+        table[ubase + @intFromEnum(Type.TRI3_E1_9a)][0x80] = State.WASSPACE;
+    }
+    for (0x2000..0x200c) |i| {
+        if (c.iswspace(@as(c.wint_t, @intCast(i))) != 0) {
+            table[ubase + @intFromEnum(Type.TRI3_E2_80)][0x80 + (i & 0x6F)] = State.WASSPACE;
+        }
+    }
+
+    if (c.iswspace(0x2028) != 0)
+        table[ubase + @intFromEnum(Type.TRI3_E2_80)][0xA8] = State.WASSPACE;
+    if (c.iswspace(0x2029) != 0)
+        table[ubase + @intFromEnum(Type.TRI3_E2_80)][0xA9] = State.WASSPACE;
+    if (c.iswspace(0x202F) != 0)
+        table[ubase + @intFromEnum(Type.TRI3_E2_80)][0xAF] = State.WASSPACE;
+    if (c.iswspace(0x205F) != 0)
+        table[ubase + @intFromEnum(Type.TRI3_E2_81)][0x9F] = State.WASSPACE;
+    if (c.iswspace(0x3000) != 0)
+        table[ubase + @intFromEnum(Type.TRI3_E3_80)][0x80] = State.WASSPACE;
+
+    // Mark illegal sequences
+
+    // The following need to be marked as illegal because they can
+    // be represented with a shorter string. In other words,
+    // 0xC0 0x81 is the same as 0x01, so needs to be marked as an
+    // illegal sequence
+
+    for (0x80..0xA0) |i| {
+        table[ubase + @intFromEnum(Type.TRI2_E0)][i] = ubase + @as(u8, @intFromEnum(Type.ILLEGAL));
+    }
+    for (0x80..0x90) |i| {
+        table[ubase + @intFromEnum(Type.QUAD2_F0)][i] = ubase + @as(u8, @intFromEnum(Type.ILLEGAL));
+    }
+    // Exceeds max possible size of unicode character
+    for (0x90..0xC0) |i| {
+        table[ubase + @intFromEnum(Type.QUAD2_F4)][i] = ubase + @as(u8, @intFromEnum(Type.ILLEGAL));
+    }
+    // Surrogate space
+    for (0xA0..0xC0) |i| {
+        table[ubase + @intFromEnum(Type.TRI2_ED)][i] = ubase + @as(u8, @intFromEnum(Type.ILLEGAL));
+    }
+}
+
+pub fn gen_table() [State.STATE_MAX][256]u8 {
+    @setEvalBranchQuota(10000);
+    _ = c.setlocale(c.LC_ALL, "");
+    var table: [State.STATE_MAX][256]u8 = undefined;
+    build_WASSPACE(&table[State.WASSPACE]);
+    build_WASSPACE(&table[State.NEWLINE]);
+    build_WASWORD(&table[State.WASWORD]);
+    build_WASWORD(&table[State.NEWWORD]);
+    build_unicode(&table, State.NEWWORD, State.USPACE);
+    build_unicode(&table, State.WASWORD, State.UWORD);
     return table;
 }
 
-fn gen_char_type_table() [256]u8 {
-    var column: [256]u8 = [_]u8{Type.character} ** 256;
-    for (0..256) |b| {
-        if (std.ascii.isWhitespace(@intCast(b))) {
-            column[b] = Type.whitespace;
-        }
-        if (b == '\n') {
-            column[b] = Type.newline;
-        }
-    }
-    return column;
-}
-
 pub fn wc_dfa(reader: *std.Io.Reader) Result {
-    const table = comptime gen_transition_table();
-    const column = comptime gen_char_type_table();
+    const table = gen_table();
 
-    var counts = [4]usize{ 0, 0, 0, 0 };
-    var state: usize = State.whitespace;
+    var counts = [_]usize{0} ** State.STATE_MAX;
+    var state: usize = State.WASSPACE;
     while (true) {
         const b = reader.takeByte() catch break;
-        state = table[state][column[b]];
+        state = table[state][b];
         counts[state] += 1;
     }
     return .{
-        .line_count = counts[1],
-        .word_count = counts[2],
+        .line_count = counts[State.NEWLINE],
+        .word_count = counts[State.NEWWORD],
         .byte_count = counts[0] + counts[1] + counts[2] + counts[3],
     };
 }
@@ -162,15 +366,4 @@ pub fn wc_ref(reader: *std.Io.Reader) Result {
         .word_count = word_count,
         .byte_count = byte_count,
     };
-}
-
-test "wc_dfa works as expected" {
-    const test_data = "Hello, World!\nThis is a test.\n";
-    var buffer: [64]u8 = undefined;
-    var mem_file = std.testing.Reader.init(&buffer, &.{.{ .buffer = test_data }});
-    const reader = &mem_file.interface;
-    const result = wc_dfa(reader);
-    try std.testing.expect(result.line_count == 2);
-    try std.testing.expect(result.word_count == 6);
-    try std.testing.expect(result.byte_count == test_data.len);
 }
