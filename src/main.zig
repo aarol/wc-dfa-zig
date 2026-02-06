@@ -12,15 +12,13 @@ pub fn main() !void {
         .line_count = 0,
         .word_count = 0,
         .byte_count = 0,
+        .char_count = 0,
     };
     var processed_files: usize = 0;
     while (args.next()) |arg| {
         var file = try std.fs.cwd().openFile(arg, .{ .mode = .read_only });
         defer file.close();
-        var buf: [65536]u8 = undefined;
-        var file_reader = file.reader(&buf);
-        const reader = &file_reader.interface;
-        const res = wc_dfa(reader);
+        const res = try processFile(&file);
         result.line_count += res.line_count;
         result.word_count += res.word_count;
         result.byte_count += res.byte_count;
@@ -29,28 +27,36 @@ pub fn main() !void {
 
     if (processed_files == 0) {
         var stdin_file = std.fs.File.stdin();
-        var buf: [65536]u8 = undefined;
-        var stdin = stdin_file.reader(&buf);
-        const reader = &stdin.interface;
-        const res = wc_dfa(reader);
+        const res = try processFile(&stdin_file);
         result.line_count += res.line_count;
         result.word_count += res.word_count;
         result.byte_count += res.byte_count;
+        result.char_count += res.char_count;
     }
 
-    var stdout_buf = [_]u8{0} ** 65536;
+    var stdout_buf: [BUF_SIZE]u8 = undefined;
     var stdout = std.fs.File.stdout().writer(&stdout_buf);
     try stdout.interface.print("{d} {d} {d}\n", .{ result.line_count, result.word_count, result.byte_count });
     try stdout.interface.flush();
+}
+
+const BUF_SIZE = 65536;
+
+fn processFile(file: *std.fs.File) !Result {
+    var buf: [BUF_SIZE]u8 = undefined;
+    var file_reader = file.reader(&buf);
+    const reader = &file_reader.interface;
+    return wc_dfa(reader);
 }
 
 const Result = struct {
     line_count: usize,
     word_count: usize,
     byte_count: usize,
+    char_count: usize,
 };
 
-const Type = struct {
+const Utf8Type = struct {
     DUO2_xx: u8 = 0,
     DUO2_C2: u8 = 1,
     TRI2_E0: u8 = 2,
@@ -87,7 +93,7 @@ const Type = struct {
 // ILLEGAL is at index 30, so we can calculate:
 // UWORD = USPACE + ILLEGAL + 1 = 4 + 30 + 1 = 35
 // STATE_MAX = UWORD + ILLEGAL + 1 = 35 + 30 + 1 = 66
-// There are a lot of states between USPACE and UWORD that are not represented here.
+// There are a lot of states between USPACE, UWORD and STATE_MAX that are not represented here.
 // These are the unicode multibyte states defined in Type.
 const State = struct {
     WASSPACE: usize = 0,
@@ -99,157 +105,160 @@ const State = struct {
     STATE_MAX: usize = 66,
 }{};
 
-pub fn build_basic(row: *[256]u8, default_state: u8, ubase: u8) void {
+pub fn build_first_byte_states(row: *[256]u8, base_state: u8, word_state: u8) void {
     for (0..256) |i| {
         const b: u8 = @intCast(i);
-        if ((b & 0x80) != 0) {
+        if ((b & 0x80) != 0) { // Starts with 1xxxxxxx
             if ((b & 0xE0) == 0xC0) {
                 // 110x xxxx - unicode 2 byte sequence
                 if (b < 0xC2) {
-                    row[b] = ubase + @as(u8, Type.ILLEGAL);
+                    row[b] = base_state + @as(u8, Utf8Type.ILLEGAL);
                 } else if (b == 0xC2) {
-                    row[b] = ubase + @as(u8, Type.DUO2_C2);
+                    row[b] = base_state + @as(u8, Utf8Type.DUO2_C2);
                 } else {
-                    row[b] = ubase + @as(u8, Type.DUO2_xx);
+                    row[b] = base_state + @as(u8, Utf8Type.DUO2_xx);
                 }
             } else if ((b & 0xF0) == 0xE0) {
                 // 1110 xxxx - unicode 3 byte sequence
                 switch (b) {
-                    0xE0 => row[b] = ubase + @as(u8, Type.TRI2_E0),
-                    0xE1 => row[b] = ubase + @as(u8, Type.TRI2_E1),
-                    0xE2 => row[b] = ubase + @as(u8, Type.TRI2_E2),
-                    0xE3 => row[b] = ubase + @as(u8, Type.TRI2_E3),
-                    0xED => row[b] = ubase + @as(u8, Type.TRI2_ED),
-                    0xEE => row[b] = ubase + @as(u8, Type.TRI2_EE),
-                    else => row[b] = ubase + @as(u8, Type.TRI2_xx),
+                    0xE0 => row[b] = base_state + @as(u8, Utf8Type.TRI2_E0),
+                    0xE1 => row[b] = base_state + @as(u8, Utf8Type.TRI2_E1),
+                    0xE2 => row[b] = base_state + @as(u8, Utf8Type.TRI2_E2),
+                    0xE3 => row[b] = base_state + @as(u8, Utf8Type.TRI2_E3),
+                    0xED => row[b] = base_state + @as(u8, Utf8Type.TRI2_ED),
+                    0xEE => row[b] = base_state + @as(u8, Utf8Type.TRI2_EE),
+                    else => row[b] = base_state + @as(u8, Utf8Type.TRI2_xx),
                 }
             } else if ((b & 0xF8) == 0xF0) {
+                // 1111 0xxx - unicode 4 byte sequence
                 if (b >= 0xF5) {
-                    row[b] = ubase + @as(u8, Type.ILLEGAL);
+                    row[b] = base_state + @as(u8, Utf8Type.ILLEGAL);
                 } else if (b == 0xF0) {
-                    row[b] = ubase + @as(u8, Type.QUAD2_F0);
+                    row[b] = base_state + @as(u8, Utf8Type.QUAD2_F0);
                 } else if (b == 0xF4) {
-                    row[b] = ubase + @as(u8, Type.QUAD2_F4);
+                    row[b] = base_state + @as(u8, Utf8Type.QUAD2_F4);
                 } else {
-                    row[b] = ubase + @as(u8, Type.QUAD2_xx);
+                    row[b] = base_state + @as(u8, Utf8Type.QUAD2_xx);
                 }
             } else {
-                row[b] = ubase + @as(u8, Type.ILLEGAL);
+                row[b] = base_state + @as(u8, Utf8Type.ILLEGAL);
             }
+            // Unicode 1 byte sequences
         } else if (b == '\n') {
             row[b] = State.NEWLINE;
         } else if (std.ascii.isWhitespace(b)) {
             row[b] = State.WASSPACE;
         } else {
-            row[b] = default_state;
+            row[b] = word_state;
         }
     }
 }
 
 const Table = [State.STATE_MAX][256]u8;
 
-fn build_WASSPACE(row: *[256]u8) void {
-    build_basic(row, State.NEWWORD, State.USPACE);
-}
-
-fn build_WASWORD(row: *[256]u8) void {
-    build_basic(row, State.WASWORD, State.UWORD);
-}
-
-fn build_urow(table: *Table, ubase: u8, id: u8, init_next: u8) void {
-    var next: u8 = init_next;
-    const default_state = table[ubase + Type.ILLEGAL][0];
-    if (next == 0) {
-        next = default_state;
+fn build_utf8_state_row(table: *Table, unicode_base: u8, id: u8, init_next: ?u8) void {
+    var next: u8 = 0;
+    const default_state = table[unicode_base + Utf8Type.ILLEGAL][0];
+    if (init_next) |n| {
+        next = unicode_base + n;
     } else {
-        next = ubase + next;
+        next = default_state;
     }
 
-    @memcpy(&table[ubase + id], &table[ubase + Type.ILLEGAL]);
+    @memcpy(&table[unicode_base + id], &table[unicode_base + Utf8Type.ILLEGAL]);
 
     for (0x80..0xC0) |i| {
-        table[ubase + id][i] = next;
+        table[unicode_base + id][i] = next;
     }
 
     for (0xC0..0x100) |i| {
-        table[ubase + id][i] = ubase + @as(u8, Type.ILLEGAL);
+        table[unicode_base + id][i] = unicode_base + @as(u8, Utf8Type.ILLEGAL);
     }
 }
 
-fn build_unicode(table: *Table, default_state: u8, ubase: u8) void {
-    build_basic(&table[ubase + Type.ILLEGAL], default_state, ubase);
+/// Builds a state transition table for UTF-8 byte sequence validation.
+/// The DFA tracks:
+/// - UTF-8 multi-byte sequences (2, 3, and 4 byte sequences)
+/// - Word boundaries (whitespace vs non-whitespace)
+/// - Newlines
+/// - Invalid UTF-8 sequences
+fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
+    // Set the illegal state for this unicode base area.
+    // This will keep us in the same state if we encounter a malformed UTF-8 sequence.
+    // And also act as a "default state" for other states to copy from.
+    build_first_byte_states(&table[base_state + Utf8Type.ILLEGAL], base_state, word_state);
 
     // Two byte
-    build_urow(table, ubase, Type.DUO2_xx, 0);
-    build_urow(table, ubase, Type.DUO2_C2, 0);
+    build_utf8_state_row(table, base_state, Utf8Type.DUO2_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.DUO2_C2, null);
 
     // Three byte
-    build_urow(table, ubase, Type.TRI2_E0, Type.TRI3_E0_xx);
-    build_urow(table, ubase, Type.TRI2_E1, Type.TRI3_E1_xx);
-    build_urow(table, ubase, Type.TRI2_E2, Type.TRI3_E2_xx);
-    build_urow(table, ubase, Type.TRI2_E3, Type.TRI3_E3_xx);
-    build_urow(table, ubase, Type.TRI2_ED, Type.TRI3_Ed_xx);
-    build_urow(table, ubase, Type.TRI2_EE, Type.TRI3_Ee_xx);
-    build_urow(table, ubase, Type.TRI2_xx, Type.TRI3_xx_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI2_E0, Utf8Type.TRI3_E0_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI2_E1, Utf8Type.TRI3_E1_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI2_E2, Utf8Type.TRI3_E2_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI2_E3, Utf8Type.TRI3_E3_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI2_ED, Utf8Type.TRI3_Ed_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI2_EE, Utf8Type.TRI3_Ee_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI2_xx, Utf8Type.TRI3_xx_xx);
 
-    build_urow(table, ubase, Type.TRI3_E0_xx, 0);
-    build_urow(table, ubase, Type.TRI3_E1_xx, 0);
-    build_urow(table, ubase, Type.TRI3_E1_9a, 0);
-    build_urow(table, ubase, Type.TRI3_E2_80, 0);
-    build_urow(table, ubase, Type.TRI3_E2_81, 0);
-    build_urow(table, ubase, Type.TRI3_E2_xx, 0);
-    build_urow(table, ubase, Type.TRI3_E3_80, 0);
-    build_urow(table, ubase, Type.TRI3_E3_81, 0);
-    build_urow(table, ubase, Type.TRI3_E3_xx, 0);
-    build_urow(table, ubase, Type.TRI3_Ed_xx, 0);
-    build_urow(table, ubase, Type.TRI3_Ee_xx, 0);
-    build_urow(table, ubase, Type.TRI3_xx_xx, 0);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E0_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E1_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E1_9a, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E2_80, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E2_81, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E2_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E3_80, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E3_81, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_E3_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_Ed_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_Ee_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.TRI3_xx_xx, null);
 
-    table[ubase + Type.TRI2_E1][0x9a] = ubase + Type.TRI3_E1_9a;
-    table[ubase + Type.TRI2_E2][0x80] = ubase + @as(u8, Type.TRI3_E2_80);
-    table[ubase + Type.TRI2_E2][0x81] = ubase + @as(u8, Type.TRI3_E2_81);
-    table[ubase + Type.TRI2_E3][0x80] = ubase + @as(u8, Type.TRI3_E3_80);
-    table[ubase + Type.TRI2_E3][0x81] = ubase + @as(u8, Type.TRI3_E3_81);
+    table[base_state + Utf8Type.TRI2_E1][0x9a] = base_state + Utf8Type.TRI3_E1_9a;
+    table[base_state + Utf8Type.TRI2_E2][0x80] = base_state + @as(u8, Utf8Type.TRI3_E2_80);
+    table[base_state + Utf8Type.TRI2_E2][0x81] = base_state + @as(u8, Utf8Type.TRI3_E2_81);
+    table[base_state + Utf8Type.TRI2_E3][0x80] = base_state + @as(u8, Utf8Type.TRI3_E3_80);
+    table[base_state + Utf8Type.TRI2_E3][0x81] = base_state + @as(u8, Utf8Type.TRI3_E3_81);
 
     // Four byte
-    build_urow(table, ubase, Type.QUAD2_xx, Type.QUAD3_xx_xx);
-    build_urow(table, ubase, Type.QUAD2_F0, Type.QUAD3_F0_xx);
-    build_urow(table, ubase, Type.QUAD2_F4, Type.QUAD3_F4_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD2_xx, Utf8Type.QUAD3_xx_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD2_F0, Utf8Type.QUAD3_F0_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD2_F4, Utf8Type.QUAD3_F4_xx);
 
-    build_urow(table, ubase, Type.QUAD3_xx_xx, Type.QUAD4_xx_xx_xx);
-    build_urow(table, ubase, Type.QUAD3_F0_xx, Type.QUAD4_F0_xx_xx);
-    build_urow(table, ubase, Type.QUAD3_F4_xx, Type.QUAD4_F4_xx_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD3_xx_xx, Utf8Type.QUAD4_xx_xx_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD3_F0_xx, Utf8Type.QUAD4_F0_xx_xx);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD3_F4_xx, Utf8Type.QUAD4_F4_xx_xx);
 
-    build_urow(table, ubase, Type.QUAD4_xx_xx_xx, 0);
-    build_urow(table, ubase, Type.QUAD4_F0_xx_xx, 0);
-    build_urow(table, ubase, Type.QUAD4_F4_xx_xx, 0);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD4_xx_xx_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD4_F0_xx_xx, null);
+    build_utf8_state_row(table, base_state, Utf8Type.QUAD4_F4_xx_xx, null);
 
     // Mark unicode spaces
     if (c.iswspace(0x0085) != 0) {
-        table[ubase + Type.DUO2_C2][0x85] = State.WASSPACE;
+        table[base_state + Utf8Type.DUO2_C2][0x85] = State.WASSPACE;
     }
     if (c.iswspace(0x00A0) != 0) {
-        table[ubase + Type.DUO2_C2][0xA0] = State.WASSPACE;
+        table[base_state + Utf8Type.DUO2_C2][0xA0] = State.WASSPACE;
     }
     if (c.iswspace(0x1680) != 0) {
-        table[ubase + Type.TRI3_E1_9a][0x80] = State.WASSPACE;
+        table[base_state + Utf8Type.TRI3_E1_9a][0x80] = State.WASSPACE;
     }
     for (0x2000..0x200c) |i| {
         if (c.iswspace(@as(c.wint_t, @intCast(i))) != 0) {
-            table[ubase + Type.TRI3_E2_80][0x80 + (i & 0x6F)] = State.WASSPACE;
+            table[base_state + Utf8Type.TRI3_E2_80][0x80 + (i & 0x6F)] = State.WASSPACE;
         }
     }
 
     if (c.iswspace(0x2028) != 0)
-        table[ubase + Type.TRI3_E2_80][0xA8] = State.WASSPACE;
+        table[base_state + Utf8Type.TRI3_E2_80][0xA8] = State.WASSPACE;
     if (c.iswspace(0x2029) != 0)
-        table[ubase + Type.TRI3_E2_80][0xA9] = State.WASSPACE;
+        table[base_state + Utf8Type.TRI3_E2_80][0xA9] = State.WASSPACE;
     if (c.iswspace(0x202F) != 0)
-        table[ubase + Type.TRI3_E2_80][0xAF] = State.WASSPACE;
+        table[base_state + Utf8Type.TRI3_E2_80][0xAF] = State.WASSPACE;
     if (c.iswspace(0x205F) != 0)
-        table[ubase + Type.TRI3_E2_81][0x9F] = State.WASSPACE;
+        table[base_state + Utf8Type.TRI3_E2_81][0x9F] = State.WASSPACE;
     if (c.iswspace(0x3000) != 0)
-        table[ubase + Type.TRI3_E3_80][0x80] = State.WASSPACE;
+        table[base_state + Utf8Type.TRI3_E3_80][0x80] = State.WASSPACE;
 
     // Mark illegal sequences
 
@@ -259,18 +268,18 @@ fn build_unicode(table: *Table, default_state: u8, ubase: u8) void {
     // illegal sequence
 
     for (0x80..0xA0) |i| {
-        table[ubase + Type.TRI2_E0][i] = ubase + @as(u8, Type.ILLEGAL);
+        table[base_state + Utf8Type.TRI2_E0][i] = base_state + @as(u8, Utf8Type.ILLEGAL);
     }
     for (0x80..0x90) |i| {
-        table[ubase + Type.QUAD2_F0][i] = ubase + @as(u8, Type.ILLEGAL);
+        table[base_state + Utf8Type.QUAD2_F0][i] = base_state + @as(u8, Utf8Type.ILLEGAL);
     }
     // Exceeds max possible size of unicode character
     for (0x90..0xC0) |i| {
-        table[ubase + Type.QUAD2_F4][i] = ubase + @as(u8, Type.ILLEGAL);
+        table[base_state + Utf8Type.QUAD2_F4][i] = base_state + @as(u8, Utf8Type.ILLEGAL);
     }
     // Surrogate space
     for (0xA0..0xC0) |i| {
-        table[ubase + Type.TRI2_ED][i] = ubase + @as(u8, Type.ILLEGAL);
+        table[base_state + Utf8Type.TRI2_ED][i] = base_state + @as(u8, Utf8Type.ILLEGAL);
     }
 }
 
@@ -278,12 +287,18 @@ pub fn gen_table() [State.STATE_MAX][256]u8 {
     @setEvalBranchQuota(10000);
     _ = c.setlocale(c.LC_ALL, "");
     var table: [State.STATE_MAX][256]u8 = undefined;
-    build_WASSPACE(&table[State.WASSPACE]);
-    build_WASSPACE(&table[State.NEWLINE]);
-    build_WASWORD(&table[State.WASWORD]);
-    build_WASWORD(&table[State.NEWWORD]);
-    build_unicode(&table, State.NEWWORD, State.USPACE);
-    build_unicode(&table, State.WASWORD, State.UWORD);
+    // Row, base state, word state
+    // In WASSPACE and NEWLINE states, non-whitespace ASCII goes to NEWWORD
+    build_first_byte_states(&table[State.WASSPACE], State.USPACE, State.NEWWORD);
+    build_first_byte_states(&table[State.NEWLINE], State.USPACE, State.NEWWORD);
+    // In WASWORD and NEWWORD states, non-whitespace ASCII goes to WASWORD
+    build_first_byte_states(&table[State.WASWORD], State.UWORD, State.WASWORD);
+    build_first_byte_states(&table[State.NEWWORD], State.UWORD, State.WASWORD);
+    // Unicode multi-byte sequences get their own states,
+    // "USPACE" being multi-bytes sequences that started in WASSPACE or NEWLINE,
+    // and "UWORD" being multi-byte sequences that started in WASWORD or NEWWORD.
+    build_unicode(&table, State.USPACE, State.NEWWORD);
+    build_unicode(&table, State.UWORD, State.WASWORD);
     return table;
 }
 
@@ -297,9 +312,26 @@ pub fn wc_dfa(reader: *std.Io.Reader) Result {
         state = table[state][b];
         counts[state] += 1;
     }
+
+    var byte_count: usize = 0;
+    for (0..State.STATE_MAX) |i| {
+        byte_count += counts[i];
+    }
+
     return .{
         .line_count = counts[State.NEWLINE],
         .word_count = counts[State.NEWWORD],
-        .byte_count = counts[0] + counts[1] + counts[2] + counts[3],
+        .char_count = counts[0] + counts[1] + counts[2] + counts[3],
+        .byte_count = byte_count,
     };
+}
+
+test "wc_dfa counts lines, words, and bytes correctly" {
+    const input = "Hello, 世界!\nThis is a test.\n";
+    var reader = std.io.Reader.fixed(input);
+    const result = wc_dfa(&reader);
+    try std.testing.expectEqual(2, result.line_count);
+    try std.testing.expectEqual(6, result.word_count);
+    try std.testing.expectEqual(31, result.byte_count);
+    try std.testing.expectEqual(27, result.char_count);
 }
