@@ -1,43 +1,85 @@
 const std = @import("std");
+const parg = @import("parg");
 
 const c = @cImport({
     @cInclude("wctype.h");
     @cInclude("locale.h");
 });
 
+const Opts = packed struct {
+    count_lines: bool = false,
+    count_words: bool = false,
+    count_bytes: bool = false,
+    count_chars: bool = false,
+};
+
 pub fn main() !void {
-    var args = std.process.args();
-    _ = args.next(); // skip program name
-    var result = Result{
-        .line_count = 0,
-        .word_count = 0,
-        .byte_count = 0,
-        .char_count = 0,
-    };
-    var processed_files: usize = 0;
-    while (args.next()) |arg| {
-        var file = try std.fs.cwd().openFile(arg, .{ .mode = .read_only });
-        defer file.close();
-        const res = try processFile(&file);
-        result.line_count += res.line_count;
-        result.word_count += res.word_count;
-        result.byte_count += res.byte_count;
-        processed_files += 1;
+    var opts = Opts{};
+
+    var total = Result{};
+
+    const it = std.process.args();
+    var p = parg.parse(it, .{});
+    defer p.deinit();
+
+    _ = p.nextValue();
+
+    while (p.next()) |token| {
+        switch (token) {
+            .flag => |flag| {
+                if (flag.isShort("l")) {
+                    opts.count_lines = true;
+                }
+                if (flag.isShort("w")) {
+                    opts.count_words = true;
+                }
+                if (flag.isShort("c")) {
+                    opts.count_bytes = true;
+                    opts.count_chars = false;
+                }
+                if (flag.isShort("m")) {
+                    opts.count_chars = true;
+                    opts.count_bytes = false;
+                }
+            },
+            .arg => |arg| {
+                if (opts == Opts{}) {
+                    opts = Opts{
+                        .count_lines = true,
+                        .count_words = true,
+                        .count_bytes = true,
+                        .count_chars = false,
+                    };
+                }
+                var file = try std.fs.cwd().openFile(arg, .{ .mode = .read_only });
+                defer file.close();
+                const res = try processFile(&file);
+                try printResult(opts, arg, res);
+                total.line_count += res.line_count;
+                total.word_count += res.word_count;
+                total.byte_count += res.byte_count;
+                total.char_count += res.char_count;
+                total.files_processed += 1;
+            },
+            .unexpected_value => |_| {
+                return error.UnexpectedArgument;
+            },
+        }
     }
 
-    if (processed_files == 0) {
+    if (total.files_processed == 0) {
         var stdin_file = std.fs.File.stdin();
         const res = try processFile(&stdin_file);
-        result.line_count += res.line_count;
-        result.word_count += res.word_count;
-        result.byte_count += res.byte_count;
-        result.char_count += res.char_count;
+        try printResult(opts, "", res);
+        total.line_count += res.line_count;
+        total.word_count += res.word_count;
+        total.byte_count += res.byte_count;
+        total.char_count += res.char_count;
     }
 
-    var stdout_buf: [BUF_SIZE]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buf);
-    try stdout.interface.print("{d} {d} {d}\n", .{ result.line_count, result.word_count, result.byte_count });
-    try stdout.interface.flush();
+    if (total.files_processed > 1) {
+        try printResult(opts, "total", total);
+    }
 }
 
 const BUF_SIZE = 65536;
@@ -49,11 +91,32 @@ fn processFile(file: *std.fs.File) !Result {
     return wc_dfa(reader);
 }
 
+fn printResult(opts: Opts, file: []const u8, result: Result) !void {
+    var stdout_buf: [1024]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&stdout_buf);
+
+    if (opts.count_lines) {
+        try stdout.interface.print("{d} ", .{result.line_count});
+    }
+    if (opts.count_words) {
+        try stdout.interface.print("{d} ", .{result.word_count});
+    }
+    if (opts.count_bytes) {
+        try stdout.interface.print("{d} ", .{result.byte_count});
+    }
+    if (opts.count_chars) {
+        try stdout.interface.print("{d} ", .{result.char_count});
+    }
+    try stdout.interface.print("{s}\n", .{file});
+    try stdout.interface.flush();
+}
+
 const Result = struct {
-    line_count: usize,
-    word_count: usize,
-    byte_count: usize,
-    char_count: usize,
+    line_count: usize = 0,
+    word_count: usize = 0,
+    byte_count: usize = 0,
+    char_count: usize = 0,
+    files_processed: usize = 0,
 };
 
 const Utf8Type = struct {

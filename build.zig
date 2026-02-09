@@ -37,6 +37,10 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
+
+    const parg = b.dependency("parg", .{});
+    const parg_module = parg.module("parg");
+
     const exe = b.addExecutable(.{
         .name = "wc",
         .root_module = b.createModule(.{
@@ -52,7 +56,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             // List of modules available for import in source files part of the
             // root module.
-            .imports = &.{},
+            .imports = &.{
+                .{ .name = "parg", .module = parg_module },
+            },
         }),
     });
 
