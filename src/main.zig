@@ -28,9 +28,11 @@ const CountTask = struct {
 
 const EndStateTask = struct {
     chunk: []const u8,
-    results_ptr: *[State.STATE_MAX]u8,
+    results_ptr: *[32]u8,
     wg: *std.Thread.WaitGroup,
-    table: *const Table,
+    table: *const CoalescedTable,
+    uniques: *const Uniques,
+    prev_char: u8,
 };
 
 fn countWorker(task: CountTask) void {
@@ -51,24 +53,36 @@ fn countWorker(task: CountTask) void {
         byte_count += counts[j];
     }
     task.results_ptr.byte_count = byte_count;
-    std.debug.print("Worker finished {}\n", .{task.results_ptr.char_count});
+}
+
+const expect = std.testing.expect;
+
+// This will be optimized to a SIMD gather instruction
+fn gather(slice: S, index: S) S {
+    var result: [32]u8 = undefined;
+    comptime var vec_i = 0;
+    inline while (vec_i < 32) : (vec_i += 1) {
+        result[vec_i] = slice[index[vec_i]];
+    }
+    return result;
 }
 
 fn calc_end_states(task: EndStateTask) void {
     defer task.wg.finish();
+    var prev_char = task.prev_char;
 
-    var states: [State.STATE_MAX]u8 = undefined;
-    for (0..State.STATE_MAX) |i| {
-        states[i] = @intCast(i);
-    }
+    var s: S = std.simd.iota(u8, 32);
 
     for (task.chunk) |b| {
-        for (0..State.STATE_MAX) |i| {
-            states[i] = task.table[states[i]][b];
-        }
+        const t_active: S = task.table[prev_char][b][0..32].*;
+        s = gather(t_active, s);
+
+        prev_char = b;
     }
-    for (0..State.STATE_MAX) |i| {
-        task.results_ptr[i] = states[i];
+
+    const s_local: [32]u8 = s;
+    for (0..32) |i| {
+        task.results_ptr[i] = task.uniques[prev_char][s_local[i]];
     }
 }
 
@@ -168,20 +182,23 @@ fn processFile(file: *std.fs.File) !Result {
     defer allocator.free(states);
 
     // Store pointers to heap-allocated result arrays to avoid invalidation on ArrayList growth
-    var end_state_results = try allocator.alloc([State.STATE_MAX]u8, num_cpu);
+    var end_state_results = try allocator.alloc([32]u8, num_cpu);
     defer allocator.free(end_state_results);
 
     var result_counts = try allocator.alloc(Result, num_cpu);
     defer allocator.free(result_counts);
 
     const table = gen_table();
+    const coalesced_table, const uniques, const global_to_local = coalesce_table(&table);
 
     var total = Result{};
 
     // Read file into chunks and spawn workers immediately
     var wg = std.Thread.WaitGroup{};
     var i: usize = 0;
+    var prev_char: u8 = ' ';
     var incomplete_loop = false;
+    var start = std.time.microTimestamp();
     while (true) {
         if (i < num_cpu and !incomplete_loop) {
             var chunk = &chunks[i];
@@ -197,24 +214,36 @@ fn processFile(file: *std.fs.File) !Result {
                 .chunk = chunk.buffer[0..chunk.size],
                 .results_ptr = &end_state_results[i],
                 .wg = &wg,
-                .table = &table,
+                .prev_char = prev_char,
+                .table = &coalesced_table,
+                .uniques = &uniques,
             };
             try thread_pool.spawn(calc_end_states, .{task});
+            prev_char = chunk.buffer[chunk.size - 1];
 
             i += 1;
         } else {
             // Every thread is busy, wait for them to finish
             thread_pool.waitAndWork(&wg);
 
+            // var end = std.time.microTimestamp();
+            // std.debug.print("First phase took {d} ms\n", .{@divTrunc(end - start, 1000)});
+            // start = std.time.microTimestamp();
             wg.reset();
 
             // Now we can set the start states for each chunk
             // based on the end states of the previous chunks
             states[0] = prev_chunk_end_state;
             for (1..i) |j| {
-                states[j] = end_state_results[j - 1][states[j - 1]];
+                const prev_ch = if (j == 1) 0 else chunks[j - 2].buffer[chunks[j - 2].size - 1];
+                const local_idx = global_to_local[prev_ch][states[j - 1]];
+
+                states[j] = end_state_results[j - 1][local_idx];
             }
-            prev_chunk_end_state = end_state_results[i - 1][states[i - 1]];
+            const final_prev_char = chunks[i - 1].buffer[chunks[i - 1].size - 1];
+            const final_local_idx = global_to_local[final_prev_char][states[i - 1]];
+
+            prev_chunk_end_state = end_state_results[i - 1][final_local_idx];
 
             wg.startMany(i);
 
@@ -232,6 +261,9 @@ fn processFile(file: *std.fs.File) !Result {
 
             thread_pool.waitAndWork(&wg);
 
+            // end = std.time.microTimestamp();
+            // std.debug.print("Ssecond phase took {d} ms\n", .{@divTrunc(end - start, 1000)});
+
             for (0..i) |j| {
                 total.line_count += result_counts[j].line_count;
                 total.word_count += result_counts[j].word_count;
@@ -242,6 +274,7 @@ fn processFile(file: *std.fs.File) !Result {
             wg.reset();
             i = 0;
 
+            start = std.time.microTimestamp();
             if (incomplete_loop) break;
         }
     }
@@ -375,6 +408,7 @@ pub fn build_first_byte_states(row: *[256]u8, base_state: u8, word_state: u8) vo
 }
 
 const Table = [State.STATE_MAX][256]u8;
+const CoalescedTable = [256][256][32]u8;
 
 fn build_utf8_state_row(table: *Table, unicode_base: u8, id: u8, init_next: ?u8) void {
     var next: u8 = 0;
@@ -501,6 +535,57 @@ fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
     for (0xA0..0xC0) |i| {
         table[base_state + Utf8Type.TRI2_ED][i] = base_state + @as(u8, Utf8Type.ILLEGAL);
     }
+}
+
+const S = @Vector(32, u8);
+const Uniques = [256][32]u8;
+const GlobalToLocal = [256][State.STATE_MAX]u8;
+
+pub fn coalesce_table(table: *const Table) struct { CoalescedTable, Uniques, GlobalToLocal } {
+    var result: [256][256][32]u8 = undefined;
+    var uniques = [_][32]u8{[_]u8{0} ** 32} ** 256;
+    var unique_counts = [_]usize{0} ** 256;
+    var global_to_local = std.mem.zeroes([256][State.STATE_MAX]u8);
+
+    for (0..256) |ch| {
+        for (0..State.STATE_MAX) |s| {
+            const dest = table[s][ch];
+            var found = false;
+            for (uniques[ch]) |existing| {
+                if (existing == dest) {
+                    found = true;
+                }
+            }
+            if (!found) {
+                uniques[ch][unique_counts[ch]] = dest;
+                global_to_local[ch][s] = @intCast(unique_counts[ch]);
+                unique_counts[ch] += 1;
+            }
+        }
+        if (unique_counts[ch] > 32) {
+            std.debug.print("Too many unique states for byte {d}: {d}\n", .{ ch, unique_counts[ch] });
+        }
+    }
+
+    for (0..256) |prev| {
+        for (0..256) |curr| {
+            for (0..32) |i| {
+                const global_state = uniques[prev][i];
+                const next_global = table[global_state][curr];
+
+                var next_local: isize = -1;
+                for (0..32) |j| {
+                    if (uniques[curr][j] == next_global) {
+                        next_local = @intCast(j);
+                        break;
+                    }
+                }
+
+                result[prev][curr][i] = @intCast(next_local);
+            }
+        }
+    }
+    return .{ result, uniques, global_to_local };
 }
 
 pub fn gen_table() [State.STATE_MAX][256]u8 {
