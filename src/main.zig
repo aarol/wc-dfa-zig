@@ -14,59 +14,72 @@ const Opts = packed struct {
 };
 
 const ChunkData = struct {
-    buffer: *[RING_SLICE_SIZE]u8,
+    buffer: [CHUNK_SIZE]u8,
     size: usize,
 };
 
-const ChunkTask = struct {
+const CountTask = struct {
     chunk: []const u8,
-    results_ptr: *[66]Result,
+    start_state: u8,
+    results_ptr: *Result,
     wg: *std.Thread.WaitGroup,
-    table: *const [State.STATE_MAX][256]u8,
+    table: *const Table,
 };
 
-fn chunkWorker(task: ChunkTask) void {
+const EndStateTask = struct {
+    chunk: []const u8,
+    results_ptr: *[State.STATE_MAX]u8,
+    wg: *std.Thread.WaitGroup,
+    table: *const Table,
+};
+
+fn countWorker(task: CountTask) void {
     defer task.wg.finish();
 
-    var states: [State.STATE_MAX]usize = undefined;
-    for (0..State.STATE_MAX) |i| {
-        states[i] = i;
+    var counts = [_]usize{0} ** State.STATE_MAX;
+    var state = task.start_state;
+    for (task.chunk) |b| {
+        state = task.table[state][b];
+        counts[state] += 1;
     }
-    var counts = [_][66]usize{[_]usize{0} ** State.STATE_MAX} ** State.STATE_MAX;
+
+    task.results_ptr.line_count = counts[State.NEWLINE];
+    task.results_ptr.word_count = counts[State.NEWWORD];
+    task.results_ptr.char_count = counts[0] + counts[1] + counts[2] + counts[3];
+    var byte_count: usize = 0;
+    for (0..State.STATE_MAX) |j| {
+        byte_count += counts[j];
+    }
+    task.results_ptr.byte_count = byte_count;
+    std.debug.print("Worker finished {}\n", .{task.results_ptr.char_count});
+}
+
+fn calc_end_states(task: EndStateTask) void {
+    defer task.wg.finish();
+
+    var states: [State.STATE_MAX]u8 = undefined;
+    for (0..State.STATE_MAX) |i| {
+        states[i] = @intCast(i);
+    }
 
     for (task.chunk) |b| {
         for (0..State.STATE_MAX) |i| {
             states[i] = task.table[states[i]][b];
-            counts[i][states[i]] += 1;
         }
     }
-
     for (0..State.STATE_MAX) |i| {
-        task.results_ptr[i].line_count = counts[i][State.NEWLINE];
-        task.results_ptr[i].word_count = counts[i][State.NEWWORD];
-        task.results_ptr[i].char_count = counts[i][0] + counts[i][1] + counts[i][2] + counts[i][3];
-        var byte_count: usize = 0;
-        for (0..State.STATE_MAX) |j| {
-            byte_count += counts[i][j];
-        }
-        task.results_ptr[i].byte_count = byte_count;
-        task.results_ptr[i].end_state = states[i];
+        task.results_ptr[i] = states[i];
     }
 }
 
 var thread_pool: std.Thread.Pool = undefined;
 
-const SlicePool = std.heap.MemoryPool([RING_SLICE_SIZE]u8);
-
-var memory_pool: SlicePool = undefined;
-
-const RING_SLICE_SIZE = 1_000_000;
-var ring: [][RING_SLICE_SIZE]u8 = undefined;
+const CHUNK_SIZE = 2_000_000;
 
 pub fn main() !void {
     var opts = Opts{};
 
-    var total = Result{ .end_state = 0 };
+    var total = Result{};
 
     const it = std.process.args();
     var p = parg.parse(it, .{});
@@ -75,13 +88,7 @@ pub fn main() !void {
     _ = p.nextValue();
 
     try thread_pool.init(.{ .allocator = std.heap.page_allocator });
-    const num_cpu = std.Thread.getCpuCount() catch 1;
-    ring = std.heap.page_allocator.alloc([RING_SLICE_SIZE]u8, num_cpu) catch |err| {
-        std.debug.print("Failed to allocate ring buffer: {t}\n", .{err});
-        return;
-    };
 
-    memory_pool = try SlicePool.initPreheated(std.heap.page_allocator, num_cpu);
     var files_processed: usize = 0;
 
     while (p.next()) |token| {
@@ -135,6 +142,7 @@ pub fn main() !void {
         total.word_count += res.word_count;
         total.byte_count += res.byte_count;
         total.char_count += res.char_count;
+        files_processed += 1;
     }
 
     if (files_processed > 1) {
@@ -145,79 +153,97 @@ pub fn main() !void {
 const BUF_SIZE = 65536;
 
 fn processFile(file: *std.fs.File) !Result {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    const num_cpu = std.Thread.getCpuCount() catch 1;
+
+    var prev_chunk_end_state: u8 = State.WASSPACE;
     // List to store chunks and their results
-    var chunks = std.ArrayList(ChunkData){};
-    defer {
-        for (chunks.items) |chunk_data| {
-            memory_pool.destroy(@alignCast(chunk_data.buffer));
-        }
-        chunks.deinit(allocator);
-    }
+    var chunks = try allocator.alloc(ChunkData, num_cpu);
+    defer allocator.free(chunks);
+
+    var states = try allocator.alloc(u8, num_cpu);
+    defer allocator.free(states);
 
     // Store pointers to heap-allocated result arrays to avoid invalidation on ArrayList growth
-    var chunk_results = std.ArrayList(*[66]Result){};
-    defer {
-        for (chunk_results.items) |results_ptr| {
-            allocator.destroy(results_ptr);
-        }
-        chunk_results.deinit(allocator);
-    }
+    var end_state_results = try allocator.alloc([State.STATE_MAX]u8, num_cpu);
+    defer allocator.free(end_state_results);
 
-    // Generate DFA table once to avoid setlocale race condition in workers
+    var result_counts = try allocator.alloc(Result, num_cpu);
+    defer allocator.free(result_counts);
+
     const table = gen_table();
+
+    var total = Result{};
 
     // Read file into chunks and spawn workers immediately
     var wg = std.Thread.WaitGroup{};
+    var i: usize = 0;
+    var incomplete_loop = false;
     while (true) {
-        const chunk_buffer = try memory_pool.create();
-        const bytes_read = try file.read(chunk_buffer);
-        if (bytes_read == 0) {
-            memory_pool.destroy(@alignCast(chunk_buffer));
-            break;
+        if (i < num_cpu and !incomplete_loop) {
+            var chunk = &chunks[i];
+            const bytes_read = try file.read(&chunk.buffer);
+            chunk.size = bytes_read;
+            if (bytes_read == 0) {
+                incomplete_loop = true;
+                continue;
+            }
+
+            wg.start();
+            const task = EndStateTask{
+                .chunk = chunk.buffer[0..chunk.size],
+                .results_ptr = &end_state_results[i],
+                .wg = &wg,
+                .table = &table,
+            };
+            try thread_pool.spawn(calc_end_states, .{task});
+
+            i += 1;
+        } else {
+            // Every thread is busy, wait for them to finish
+            thread_pool.waitAndWork(&wg);
+
+            wg.reset();
+
+            // Now we can set the start states for each chunk
+            // based on the end states of the previous chunks
+            states[0] = prev_chunk_end_state;
+            for (1..i) |j| {
+                states[j] = end_state_results[j - 1][states[j - 1]];
+            }
+            prev_chunk_end_state = end_state_results[i - 1][states[i - 1]];
+
+            wg.startMany(i);
+
+            // Now, calculate the results for each chunk with the correct start states
+            for (0..i) |j| {
+                const task = CountTask{
+                    .chunk = chunks[j].buffer[0..chunks[j].size],
+                    .start_state = states[j],
+                    .results_ptr = &result_counts[j],
+                    .wg = &wg,
+                    .table = &table,
+                };
+                try thread_pool.spawn(countWorker, .{task});
+            }
+
+            thread_pool.waitAndWork(&wg);
+
+            for (0..i) |j| {
+                total.line_count += result_counts[j].line_count;
+                total.word_count += result_counts[j].word_count;
+                total.byte_count += result_counts[j].byte_count;
+                total.char_count += result_counts[j].char_count;
+            }
+
+            wg.reset();
+            i = 0;
+
+            if (incomplete_loop) break;
         }
-
-        // Store the chunk
-        try chunks.append(allocator, .{
-            .buffer = chunk_buffer,
-            .size = bytes_read,
-        });
-
-        // Allocate result array on heap to prevent pointer invalidation
-        const results_ptr = try allocator.create([66]Result);
-        results_ptr.* = [_]Result{Result{}} ** 66;
-        try chunk_results.append(allocator, results_ptr);
-
-        // Spawn worker immediately for this chunk
-        wg.start();
-        const task = ChunkTask{
-            .chunk = chunk_buffer[0..bytes_read],
-            .results_ptr = results_ptr,
-            .wg = &wg,
-            .table = &table,
-        };
-        try thread_pool.spawn(chunkWorker, .{task});
-    }
-
-    // If no chunks, return empty result
-    if (chunks.items.len == 0) {
-        return Result{};
-    }
-
-    // Wait for all workers to complete
-    thread_pool.waitAndWork(&wg);
-
-    var total = Result{};
-    var state = State.WASSPACE;
-    for (chunk_results.items) |results_ptr| {
-        total.line_count += results_ptr[state].line_count;
-        total.word_count += results_ptr[state].word_count;
-        total.byte_count += results_ptr[state].byte_count;
-        total.char_count += results_ptr[state].char_count;
-        state = results_ptr[state].end_state;
     }
 
     return total;
@@ -248,7 +274,6 @@ const Result = struct {
     word_count: usize = 0,
     byte_count: usize = 0,
     char_count: usize = 0,
-    end_state: usize = 0,
 };
 
 const Utf8Type = struct {
