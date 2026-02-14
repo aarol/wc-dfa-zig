@@ -13,16 +13,76 @@ const Opts = packed struct {
     count_chars: bool = false,
 };
 
+const ChunkData = struct {
+    buffer: *[RING_SLICE_SIZE]u8,
+    size: usize,
+};
+
+const ChunkTask = struct {
+    chunk: []const u8,
+    results_ptr: *[66]Result,
+    wg: *std.Thread.WaitGroup,
+    table: *const [State.STATE_MAX][256]u8,
+};
+
+fn chunkWorker(task: ChunkTask) void {
+    defer task.wg.finish();
+
+    var states: [State.STATE_MAX]usize = undefined;
+    for (0..State.STATE_MAX) |i| {
+        states[i] = i;
+    }
+    var counts = [_][66]usize{[_]usize{0} ** State.STATE_MAX} ** State.STATE_MAX;
+
+    for (task.chunk) |b| {
+        for (0..State.STATE_MAX) |i| {
+            states[i] = task.table[states[i]][b];
+            counts[i][states[i]] += 1;
+        }
+    }
+
+    for (0..State.STATE_MAX) |i| {
+        task.results_ptr[i].line_count = counts[i][State.NEWLINE];
+        task.results_ptr[i].word_count = counts[i][State.NEWWORD];
+        task.results_ptr[i].char_count = counts[i][0] + counts[i][1] + counts[i][2] + counts[i][3];
+        var byte_count: usize = 0;
+        for (0..State.STATE_MAX) |j| {
+            byte_count += counts[i][j];
+        }
+        task.results_ptr[i].byte_count = byte_count;
+        task.results_ptr[i].end_state = states[i];
+    }
+}
+
+var thread_pool: std.Thread.Pool = undefined;
+
+const SlicePool = std.heap.MemoryPool([RING_SLICE_SIZE]u8);
+
+var memory_pool: SlicePool = undefined;
+
+const RING_SLICE_SIZE = 1_000_000;
+var ring: [][RING_SLICE_SIZE]u8 = undefined;
+
 pub fn main() !void {
     var opts = Opts{};
 
-    var total = Result{};
+    var total = Result{ .end_state = 0 };
 
     const it = std.process.args();
     var p = parg.parse(it, .{});
     defer p.deinit();
 
     _ = p.nextValue();
+
+    try thread_pool.init(.{ .allocator = std.heap.page_allocator });
+    const num_cpu = std.Thread.getCpuCount() catch 1;
+    ring = std.heap.page_allocator.alloc([RING_SLICE_SIZE]u8, num_cpu) catch |err| {
+        std.debug.print("Failed to allocate ring buffer: {t}\n", .{err});
+        return;
+    };
+
+    memory_pool = try SlicePool.initPreheated(std.heap.page_allocator, num_cpu);
+    var files_processed: usize = 0;
 
     while (p.next()) |token| {
         switch (token) {
@@ -59,15 +119,15 @@ pub fn main() !void {
                 total.word_count += res.word_count;
                 total.byte_count += res.byte_count;
                 total.char_count += res.char_count;
-                total.files_processed += 1;
+                files_processed += 1;
             },
-            .unexpected_value => |_| {
+            .unexpected_value => {
                 return error.UnexpectedArgument;
             },
         }
     }
 
-    if (total.files_processed == 0) {
+    if (files_processed == 0) {
         var stdin_file = std.fs.File.stdin();
         const res = try processFile(&stdin_file);
         try printResult(opts, "", res);
@@ -77,7 +137,7 @@ pub fn main() !void {
         total.char_count += res.char_count;
     }
 
-    if (total.files_processed > 1) {
+    if (files_processed > 1) {
         try printResult(opts, "total", total);
     }
 }
@@ -85,10 +145,82 @@ pub fn main() !void {
 const BUF_SIZE = 65536;
 
 fn processFile(file: *std.fs.File) !Result {
-    var buf: [BUF_SIZE]u8 = undefined;
-    var file_reader = file.reader(&buf);
-    const reader = &file_reader.interface;
-    return wc_dfa(reader);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // List to store chunks and their results
+    var chunks = std.ArrayList(ChunkData){};
+    defer {
+        for (chunks.items) |chunk_data| {
+            memory_pool.destroy(@alignCast(chunk_data.buffer));
+        }
+        chunks.deinit(allocator);
+    }
+
+    // Store pointers to heap-allocated result arrays to avoid invalidation on ArrayList growth
+    var chunk_results = std.ArrayList(*[66]Result){};
+    defer {
+        for (chunk_results.items) |results_ptr| {
+            allocator.destroy(results_ptr);
+        }
+        chunk_results.deinit(allocator);
+    }
+
+    // Generate DFA table once to avoid setlocale race condition in workers
+    const table = gen_table();
+
+    // Read file into chunks and spawn workers immediately
+    var wg = std.Thread.WaitGroup{};
+    while (true) {
+        const chunk_buffer = try memory_pool.create();
+        const bytes_read = try file.read(chunk_buffer);
+        if (bytes_read == 0) {
+            memory_pool.destroy(@alignCast(chunk_buffer));
+            break;
+        }
+
+        // Store the chunk
+        try chunks.append(allocator, .{
+            .buffer = chunk_buffer,
+            .size = bytes_read,
+        });
+
+        // Allocate result array on heap to prevent pointer invalidation
+        const results_ptr = try allocator.create([66]Result);
+        results_ptr.* = [_]Result{Result{}} ** 66;
+        try chunk_results.append(allocator, results_ptr);
+
+        // Spawn worker immediately for this chunk
+        wg.start();
+        const task = ChunkTask{
+            .chunk = chunk_buffer[0..bytes_read],
+            .results_ptr = results_ptr,
+            .wg = &wg,
+            .table = &table,
+        };
+        try thread_pool.spawn(chunkWorker, .{task});
+    }
+
+    // If no chunks, return empty result
+    if (chunks.items.len == 0) {
+        return Result{};
+    }
+
+    // Wait for all workers to complete
+    thread_pool.waitAndWork(&wg);
+
+    var total = Result{};
+    var state = State.WASSPACE;
+    for (chunk_results.items) |results_ptr| {
+        total.line_count += results_ptr[state].line_count;
+        total.word_count += results_ptr[state].word_count;
+        total.byte_count += results_ptr[state].byte_count;
+        total.char_count += results_ptr[state].char_count;
+        state = results_ptr[state].end_state;
+    }
+
+    return total;
 }
 
 fn printResult(opts: Opts, file: []const u8, result: Result) !void {
@@ -116,7 +248,7 @@ const Result = struct {
     word_count: usize = 0,
     byte_count: usize = 0,
     char_count: usize = 0,
-    files_processed: usize = 0,
+    end_state: usize = 0,
 };
 
 const Utf8Type = struct {
