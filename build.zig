@@ -40,7 +40,6 @@ pub fn build(b: *std.Build) void {
 
     const parg = b.dependency("parg", .{});
     const parg_module = parg.module("parg");
-
     const exe = b.addExecutable(.{
         .name = "wc",
         .root_module = b.createModule(.{
