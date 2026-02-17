@@ -59,6 +59,14 @@ const expect = std.testing.expect;
 
 // This will be optimized to a SIMD gather instruction
 fn gather(slice: S, index: S) S {
+    const methods = struct {
+        extern fn @"llvm.x86.avx2.pshuf.b"(@Vector(32, u8), @Vector(32, u8)) @Vector(32, u8);
+    };
+    const builtin = @import("builtin");
+    if ((comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))) {
+        return methods.@"llvm.x86.avx2.pshuf.b"(slice, index);
+    }
+
     var result: [32]u8 = undefined;
     comptime var vec_i = 0;
     inline while (vec_i < 32) : (vec_i += 1) {
@@ -165,13 +173,14 @@ pub fn main() !void {
 }
 
 const BUF_SIZE = 65536;
-
 fn processFile(file: *std.fs.File) !Result {
+    const num_cpu = std.Thread.getCpuCount() catch 1;
+
+    if (num_cpu == 1) return processSingleThreaded(file);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-
-    const num_cpu = std.Thread.getCpuCount() catch 1;
 
     var prev_chunk_end_state: u8 = State.WASSPACE;
     // List to store chunks and their results
@@ -189,7 +198,7 @@ fn processFile(file: *std.fs.File) !Result {
     defer allocator.free(result_counts);
 
     const table = gen_table();
-    const coalesced_table, const uniques, const global_to_local = coalesce_table(&table);
+    build_coalesce_table(&table);
 
     var total = Result{};
 
@@ -198,7 +207,6 @@ fn processFile(file: *std.fs.File) !Result {
     var i: usize = 0;
     var prev_char: u8 = ' ';
     var incomplete_loop = false;
-    var start = std.time.microTimestamp();
     while (true) {
         if (i < num_cpu and !incomplete_loop) {
             var chunk = &chunks[i];
@@ -274,12 +282,18 @@ fn processFile(file: *std.fs.File) !Result {
             wg.reset();
             i = 0;
 
-            start = std.time.microTimestamp();
             if (incomplete_loop) break;
         }
     }
 
     return total;
+}
+
+fn processSingleThreaded(file: *std.fs.File) !Result {
+    var buf: [BUF_SIZE]u8 = undefined;
+    var file_reader = file.reader(&buf);
+    const reader = &file_reader.interface;
+    return wc_dfa(reader);
 }
 
 fn printResult(opts: Opts, file: []const u8, result: Result) !void {
@@ -408,7 +422,6 @@ pub fn build_first_byte_states(row: *[256]u8, base_state: u8, word_state: u8) vo
 }
 
 const Table = [State.STATE_MAX][256]u8;
-const CoalescedTable = [256][256][32]u8;
 
 fn build_utf8_state_row(table: *Table, unicode_base: u8, id: u8, init_next: ?u8) void {
     var next: u8 = 0;
@@ -540,12 +553,16 @@ fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
 const S = @Vector(32, u8);
 const Uniques = [256][32]u8;
 const GlobalToLocal = [256][State.STATE_MAX]u8;
+const CoalescedTable = [256][256][32]u8;
 
-pub fn coalesce_table(table: *const Table) struct { CoalescedTable, Uniques, GlobalToLocal } {
-    var result: [256][256][32]u8 = undefined;
-    var uniques = [_][32]u8{[_]u8{0} ** 32} ** 256;
+var coalesced_table = std.mem.zeroes(CoalescedTable);
+var global_to_local = std.mem.zeroes(GlobalToLocal);
+var uniques: Uniques = std.mem.zeroes(Uniques);
+
+pub fn build_coalesce_table(table: *const Table) void {
+    // var uniques = [_][32]u8{[_]u8{0} ** 32} ** 256;
     var unique_counts = [_]usize{0} ** 256;
-    var global_to_local = std.mem.zeroes([256][State.STATE_MAX]u8);
+    // var global_to_local = std.mem.zeroes([256][State.STATE_MAX]u8);
 
     for (0..256) |ch| {
         for (0..State.STATE_MAX) |s| {
@@ -581,11 +598,11 @@ pub fn coalesce_table(table: *const Table) struct { CoalescedTable, Uniques, Glo
                     }
                 }
 
-                result[prev][curr][i] = @intCast(next_local);
+                coalesced_table[prev][curr][i] = @intCast(next_local);
             }
         }
     }
-    return .{ result, uniques, global_to_local };
+    return;
 }
 
 pub fn gen_table() [State.STATE_MAX][256]u8 {
@@ -607,9 +624,8 @@ pub fn gen_table() [State.STATE_MAX][256]u8 {
     return table;
 }
 
-pub fn wc_dfa(reader: *std.Io.Reader) Result {
+pub fn wc_dfa(reader: *std.Io.Reader) !Result {
     const table = gen_table();
-
     var counts = [_]usize{0} ** State.STATE_MAX;
     var state: usize = State.WASSPACE;
     while (true) {
