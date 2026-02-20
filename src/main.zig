@@ -16,6 +16,10 @@ const Opts = packed struct {
 const ChunkData = struct {
     buffer: [CHUNK_SIZE]u8,
     size: usize,
+
+    fn lastByte(self: ChunkData) u8 {
+        return self.buffer[self.size - 1];
+    }
 };
 
 const CountTask = struct {
@@ -57,16 +61,8 @@ fn countWorker(task: CountTask) void {
 
 const expect = std.testing.expect;
 
-// This will be optimized to a SIMD gather instruction
+// This will be optimized to a series of SIMD shuffle instructions
 fn gather(slice: S, index: S) S {
-    const methods = struct {
-        extern fn @"llvm.x86.avx2.pshuf.b"(@Vector(32, u8), @Vector(32, u8)) @Vector(32, u8);
-    };
-    const builtin = @import("builtin");
-    if ((comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))) {
-        return methods.@"llvm.x86.avx2.pshuf.b"(slice, index);
-    }
-
     var result: [32]u8 = undefined;
     comptime var vec_i = 0;
     inline while (vec_i < 32) : (vec_i += 1) {
@@ -174,7 +170,8 @@ pub fn main() !void {
 
 const BUF_SIZE = 65536;
 fn processFile(file: *std.fs.File) !Result {
-    const num_cpu = std.Thread.getCpuCount() catch 1;
+    // const num_cpu = std.Thread.getCpuCount() catch 1;
+    const num_cpu = 1;
 
     if (num_cpu == 1) return processSingleThreaded(file);
 
@@ -190,7 +187,7 @@ fn processFile(file: *std.fs.File) !Result {
     var states = try allocator.alloc(u8, num_cpu);
     defer allocator.free(states);
 
-    // Store pointers to heap-allocated result arrays to avoid invalidation on ArrayList growth
+    // Store pointers to heap-allocated result arrays. They will be set to undefined first.
     var end_state_results = try allocator.alloc([32]u8, num_cpu);
     defer allocator.free(end_state_results);
 
@@ -212,6 +209,7 @@ fn processFile(file: *std.fs.File) !Result {
             var chunk = &chunks[i];
             const bytes_read = try file.read(&chunk.buffer);
             chunk.size = bytes_read;
+
             if (bytes_read == 0) {
                 incomplete_loop = true;
                 continue;
@@ -239,16 +237,20 @@ fn processFile(file: *std.fs.File) !Result {
             // start = std.time.microTimestamp();
             wg.reset();
 
+            if (i == 0) {
+                break;
+            }
+
             // Now we can set the start states for each chunk
             // based on the end states of the previous chunks
             states[0] = prev_chunk_end_state;
             for (1..i) |j| {
-                const prev_ch = if (j == 1) 0 else chunks[j - 2].buffer[chunks[j - 2].size - 1];
+                const prev_ch = chunks[j - 1].lastByte();
                 const local_idx = global_to_local[prev_ch][states[j - 1]];
 
                 states[j] = end_state_results[j - 1][local_idx];
             }
-            const final_prev_char = chunks[i - 1].buffer[chunks[i - 1].size - 1];
+            const final_prev_char = chunks[i - 1].lastByte();
             const final_local_idx = global_to_local[final_prev_char][states[i - 1]];
 
             prev_chunk_end_state = end_state_results[i - 1][final_local_idx];
@@ -597,6 +599,7 @@ pub fn build_coalesce_table(table: *const Table) void {
                         break;
                     }
                 }
+                std.debug.assert(next_local != -1);
 
                 coalesced_table[prev][curr][i] = @intCast(next_local);
             }
