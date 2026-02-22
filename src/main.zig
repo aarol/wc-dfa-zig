@@ -22,6 +22,18 @@ const ChunkData = struct {
     }
 };
 
+const Slot = struct {
+    chunk: ChunkData,
+    end_state_result: [32]u8,
+    result: Result,
+    end_state_wg: std.Thread.WaitGroup,
+    count_wg: std.Thread.WaitGroup,
+    /// The byte immediately before this chunk in the file stream (needed by calc_end_states).
+    prev_char: u8,
+    /// The resolved DFA start state for this chunk (set during chaining).
+    start_state: u8,
+};
+
 const CountTask = struct {
     chunk: []const u8,
     start_state: u8,
@@ -170,8 +182,7 @@ pub fn main() !void {
 
 const BUF_SIZE = 65536;
 fn processFile(file: *std.fs.File) !Result {
-    // const num_cpu = std.Thread.getCpuCount() catch 1;
-    const num_cpu = 1;
+    const num_cpu = std.Thread.getCpuCount() catch 1;
 
     if (num_cpu == 1) return processSingleThreaded(file);
 
@@ -179,113 +190,123 @@ fn processFile(file: *std.fs.File) !Result {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var prev_chunk_end_state: u8 = State.WASSPACE;
-    // List to store chunks and their results
-    var chunks = try allocator.alloc(ChunkData, num_cpu);
-    defer allocator.free(chunks);
-
-    var states = try allocator.alloc(u8, num_cpu);
-    defer allocator.free(states);
-
-    // Store pointers to heap-allocated result arrays. They will be set to undefined first.
-    var end_state_results = try allocator.alloc([32]u8, num_cpu);
-    defer allocator.free(end_state_results);
-
-    var result_counts = try allocator.alloc(Result, num_cpu);
-    defer allocator.free(result_counts);
-
     const table = gen_table();
     build_coalesce_table(&table);
 
+    // Allocate the ring of slots.
+    const slots = try allocator.alloc(Slot, num_cpu);
+    defer allocator.free(slots);
+    for (slots) |*slot| {
+        slot.end_state_wg = .{};
+        slot.count_wg = .{};
+    }
+
     var total = Result{};
 
-    // Read file into chunks and spawn workers immediately
-    var wg = std.Thread.WaitGroup{};
-    var i: usize = 0;
-    var prev_char: u8 = ' ';
-    var incomplete_loop = false;
+    // Three cursors advance independently through the chunks.
+    // A slot at ring index (cursor % num_cpu) is "owned" by the stage whose cursor
+    // is currently pointing at it.
+    //
+    //   fill_cursor  – chunks read from file + end-state task dispatched
+    //   chain_cursor – end states resolved, start state known, count task dispatched
+    //   drain_cursor – counting done, result accumulated; slot is free for reuse
+    //
+    // Invariant: drain_cursor <= chain_cursor <= fill_cursor
+    // Ring-full guard: fill_cursor - drain_cursor < num_cpu
+    var fill_cursor: usize = 0;
+    var chain_cursor: usize = 0;
+    var drain_cursor: usize = 0;
+
+    // Persistent state threaded through the pipeline.
+    var read_prev_char: u8 = ' '; // last byte seen by the reader (for end-state tasks)
+    var prev_chunk_end_state: u8 = State.WASSPACE; // resolved end state of the last chained chunk
+
+    var eof = false;
+
     while (true) {
-        if (i < num_cpu and !incomplete_loop) {
-            var chunk = &chunks[i];
-            const bytes_read = try file.read(&chunk.buffer);
-            chunk.size = bytes_read;
+        // ── Stage 1: Fill ────────────────────────────────────────────────────────
+        // Saturate every free ring slot with a new chunk + end-state task before
+        // blocking on chain/drain. This ensures the thread pool always has a full
+        // batch of tasks queued so workers don't sleep while the main thread steals
+        // the only task via waitAndWork.
+        while (!eof and fill_cursor - drain_cursor < num_cpu) {
+            const idx = fill_cursor % num_cpu;
+            const slot = &slots[idx];
 
+            const bytes_read = try file.read(&slot.chunk.buffer);
             if (bytes_read == 0) {
-                incomplete_loop = true;
-                continue;
+                eof = true;
+            } else {
+                slot.chunk.size = bytes_read;
+                slot.prev_char = read_prev_char;
+                read_prev_char = slot.chunk.lastByte();
+
+                slot.end_state_wg = .{};
+                slot.end_state_wg.start();
+                try thread_pool.spawn(calc_end_states, .{EndStateTask{
+                    .chunk = slot.chunk.buffer[0..slot.chunk.size],
+                    .results_ptr = &slot.end_state_result,
+                    .wg = &slot.end_state_wg,
+                    .prev_char = slot.prev_char,
+                    .table = &coalesced_table,
+                    .uniques = &uniques,
+                }});
+
+                fill_cursor += 1;
             }
-
-            wg.start();
-            const task = EndStateTask{
-                .chunk = chunk.buffer[0..chunk.size],
-                .results_ptr = &end_state_results[i],
-                .wg = &wg,
-                .prev_char = prev_char,
-                .table = &coalesced_table,
-                .uniques = &uniques,
-            };
-            try thread_pool.spawn(calc_end_states, .{task});
-            prev_char = chunk.buffer[chunk.size - 1];
-
-            i += 1;
-        } else {
-            // Every thread is busy, wait for them to finish
-            thread_pool.waitAndWork(&wg);
-
-            // var end = std.time.microTimestamp();
-            // std.debug.print("First phase took {d} ms\n", .{@divTrunc(end - start, 1000)});
-            // start = std.time.microTimestamp();
-            wg.reset();
-
-            if (i == 0) {
-                break;
-            }
-
-            // Now we can set the start states for each chunk
-            // based on the end states of the previous chunks
-            states[0] = prev_chunk_end_state;
-            for (1..i) |j| {
-                const prev_ch = chunks[j - 1].lastByte();
-                const local_idx = global_to_local[prev_ch][states[j - 1]];
-
-                states[j] = end_state_results[j - 1][local_idx];
-            }
-            const final_prev_char = chunks[i - 1].lastByte();
-            const final_local_idx = global_to_local[final_prev_char][states[i - 1]];
-
-            prev_chunk_end_state = end_state_results[i - 1][final_local_idx];
-
-            wg.startMany(i);
-
-            // Now, calculate the results for each chunk with the correct start states
-            for (0..i) |j| {
-                const task = CountTask{
-                    .chunk = chunks[j].buffer[0..chunks[j].size],
-                    .start_state = states[j],
-                    .results_ptr = &result_counts[j],
-                    .wg = &wg,
-                    .table = &table,
-                };
-                try thread_pool.spawn(countWorker, .{task});
-            }
-
-            thread_pool.waitAndWork(&wg);
-
-            // end = std.time.microTimestamp();
-            // std.debug.print("Ssecond phase took {d} ms\n", .{@divTrunc(end - start, 1000)});
-
-            for (0..i) |j| {
-                total.line_count += result_counts[j].line_count;
-                total.word_count += result_counts[j].word_count;
-                total.byte_count += result_counts[j].byte_count;
-                total.char_count += result_counts[j].char_count;
-            }
-
-            wg.reset();
-            i = 0;
-
-            if (incomplete_loop) break;
         }
+
+        // ── Stage 2: Chain ────────────────────────────────────────────────────────
+        // If the next slot to chain has finished its end-state calculation, resolve
+        // the actual start state (using the chained end state from the previous slot)
+        // and dispatch the count task. This must run in order so the start-state
+        // chain stays consistent.
+        if (chain_cursor < fill_cursor) {
+            const idx = chain_cursor % num_cpu;
+            const slot = &slots[idx];
+
+            // Block until this slot's end-state task is done (while stealing other
+            // thread-pool work so we don't just spin).
+            thread_pool.waitAndWork(&slot.end_state_wg);
+
+            // Resolve start state: propagate the previous chunk's end state through
+            // this chunk's end-state mapping.
+            slot.start_state = prev_chunk_end_state;
+            const local_idx = global_to_local[slot.chunk.lastByte()][slot.start_state];
+            prev_chunk_end_state = slot.end_state_result[local_idx];
+
+            slot.count_wg = .{};
+            slot.count_wg.start();
+            try thread_pool.spawn(countWorker, .{CountTask{
+                .chunk = slot.chunk.buffer[0..slot.chunk.size],
+                .start_state = slot.start_state,
+                .results_ptr = &slot.result,
+                .wg = &slot.count_wg,
+                .table = &table,
+            }});
+
+            chain_cursor += 1;
+        }
+
+        // ── Stage 3: Drain ────────────────────────────────────────────────────────
+        // If the oldest in-flight count task is done, accumulate its result and
+        // free the slot for the fill stage.
+        if (drain_cursor < chain_cursor) {
+            const idx = drain_cursor % num_cpu;
+            const slot = &slots[idx];
+
+            thread_pool.waitAndWork(&slot.count_wg);
+
+            total.line_count += slot.result.line_count;
+            total.word_count += slot.result.word_count;
+            total.byte_count += slot.result.byte_count;
+            total.char_count += slot.result.char_count;
+
+            drain_cursor += 1;
+        }
+
+        // ── Exit ──────────────────────────────────────────────────────────────────
+        if (eof and drain_cursor == fill_cursor) break;
     }
 
     return total;

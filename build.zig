@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            // .strip = false,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
