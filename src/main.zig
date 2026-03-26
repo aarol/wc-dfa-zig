@@ -10,8 +10,6 @@ const Opts = packed struct {
     count_chars: bool = false,
 };
 
-const BUF_SIZE = 65536;
-
 pub fn main() !void {
     var opts = Opts{};
 
@@ -83,6 +81,8 @@ pub fn main() !void {
         try printResult(opts, "total", total);
     }
 }
+
+const BUF_SIZE = 65536;
 
 fn processFile(file: *std.fs.File) !dfa.Result {
     var buf: [BUF_SIZE]u8 = undefined;

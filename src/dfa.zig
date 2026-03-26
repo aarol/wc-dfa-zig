@@ -12,6 +12,29 @@ pub const Result = struct {
     char_count: usize = 0,
 };
 
+pub fn wc_dfa(reader: *std.Io.Reader) !Result {
+    const table = gen_table();
+    var counts = [_]usize{0} ** State.STATE_MAX;
+    var state: usize = State.WASSPACE;
+    while (true) {
+        const b = reader.takeByte() catch break;
+        state = table[state][b];
+        counts[state] += 1;
+    }
+
+    var byte_count: usize = 0;
+    for (0..State.STATE_MAX) |i| {
+        byte_count += counts[i];
+    }
+
+    return .{
+        .line_count = counts[State.NEWLINE],
+        .word_count = counts[State.NEWWORD],
+        .char_count = counts[0] + counts[1] + counts[2] + counts[3],
+        .byte_count = byte_count,
+    };
+}
+
 const Utf8Type = struct {
     DUO2_xx: u8 = 0,
     DUO2_C2: u8 = 1,
@@ -60,6 +83,24 @@ pub const State = struct {
     UWORD: usize = 35,
     STATE_MAX: usize = 66,
 }{};
+
+pub fn gen_table() [State.STATE_MAX][256]u8 {
+    _ = c.setlocale(c.LC_ALL, "");
+    var table: [State.STATE_MAX][256]u8 = undefined;
+    // Row, base state, word state
+    // In WASSPACE and NEWLINE states, non-whitespace ASCII goes to NEWWORD
+    build_first_byte_states(&table[State.WASSPACE], State.USPACE, State.NEWWORD);
+    build_first_byte_states(&table[State.NEWLINE], State.USPACE, State.NEWWORD);
+    // In WASWORD and NEWWORD states, non-whitespace ASCII goes to WASWORD
+    build_first_byte_states(&table[State.WASWORD], State.UWORD, State.WASWORD);
+    build_first_byte_states(&table[State.NEWWORD], State.UWORD, State.WASWORD);
+    // Unicode multi-byte sequences get their own states,
+    // "USPACE" being multi-bytes sequences that started in WASSPACE or NEWLINE,
+    // and "UWORD" being multi-byte sequences that started in WASWORD or NEWWORD.
+    build_unicode(&table, State.USPACE, State.NEWWORD);
+    build_unicode(&table, State.UWORD, State.WASWORD);
+    return table;
+}
 
 pub fn build_first_byte_states(row: *[256]u8, base_state: u8, word_state: u8) void {
     for (0..256) |i| {
@@ -238,6 +279,7 @@ fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
     }
 }
 
+// Range coalescing
 pub const Uniques = [256][32]u8;
 pub const GlobalToLocal = [256][State.STATE_MAX]u8;
 pub const CoalescedTable = [256][256][32]u8;
@@ -288,46 +330,4 @@ pub fn build_coalesce_table(table: *const Table) void {
             }
         }
     }
-}
-
-pub fn gen_table() [State.STATE_MAX][256]u8 {
-    @setEvalBranchQuota(10000);
-    _ = c.setlocale(c.LC_ALL, "");
-    var table: [State.STATE_MAX][256]u8 = undefined;
-    // Row, base state, word state
-    // In WASSPACE and NEWLINE states, non-whitespace ASCII goes to NEWWORD
-    build_first_byte_states(&table[State.WASSPACE], State.USPACE, State.NEWWORD);
-    build_first_byte_states(&table[State.NEWLINE], State.USPACE, State.NEWWORD);
-    // In WASWORD and NEWWORD states, non-whitespace ASCII goes to WASWORD
-    build_first_byte_states(&table[State.WASWORD], State.UWORD, State.WASWORD);
-    build_first_byte_states(&table[State.NEWWORD], State.UWORD, State.WASWORD);
-    // Unicode multi-byte sequences get their own states,
-    // "USPACE" being multi-bytes sequences that started in WASSPACE or NEWLINE,
-    // and "UWORD" being multi-byte sequences that started in WASWORD or NEWWORD.
-    build_unicode(&table, State.USPACE, State.NEWWORD);
-    build_unicode(&table, State.UWORD, State.WASWORD);
-    return table;
-}
-
-pub fn wc_dfa(reader: *std.Io.Reader) !Result {
-    const table = gen_table();
-    var counts = [_]usize{0} ** State.STATE_MAX;
-    var state: usize = State.WASSPACE;
-    while (true) {
-        const b = reader.takeByte() catch break;
-        state = table[state][b];
-        counts[state] += 1;
-    }
-
-    var byte_count: usize = 0;
-    for (0..State.STATE_MAX) |i| {
-        byte_count += counts[i];
-    }
-
-    return .{
-        .line_count = counts[State.NEWLINE],
-        .word_count = counts[State.NEWWORD],
-        .char_count = counts[0] + counts[1] + counts[2] + counts[3],
-        .byte_count = byte_count,
-    };
 }
