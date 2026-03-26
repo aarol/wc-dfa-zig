@@ -6,7 +6,7 @@ This is not intended as a replacement for the GNU or BSD `wc` program. For examp
 
 Instead, this is intended as a demonstration of how to implement a high-performance `wc` program using finite-state machines and data parallelism.
 
-This program is built on [Robert Graham's wc2](https://github.com/robertdavidgraham/wc2/) program. It uses a finite-state-machine which processes UTF-8 text byte-by-byte at ludicrous speed without any branching.
+This program is built on [Robert Graham's wc2](https://github.com/robertdavidgraham/wc2/) program. It uses a finite-state-machine which processes UTF-8 text byte-by-byte at constant speed without any branching.
 
 Here is what the core loop looks like:
 
@@ -22,6 +22,14 @@ while (true) {
 ```
 
 Additionally, this program implements the paper [Data-Parallel Finite-State Machines](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/asplos302-mytkowicz.pdf), which further **doubles** the speed of processing large files by processing many chunks in parallel.
+
+---
+
+For the simple version of the state machine, see [simple.zig](./src/simple.zig). 
+
+For the UTF-8 version of the state machine, see [dfa.zig](./src/dfa.zig).
+
+For the parallel version, see [parallel.zig](./src/parallel.zig).
 
 ## Benchmarks
 
