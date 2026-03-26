@@ -170,8 +170,8 @@ pub fn main() !void {
 
 const BUF_SIZE = 65536;
 fn processFile(file: *std.fs.File) !Result {
-    // const num_cpu = std.Thread.getCpuCount() catch 1;
-    const num_cpu = 1;
+    const num_cpu = std.Thread.getCpuCount() catch 1;
+    // const num_cpu = 1;
 
     if (num_cpu == 1) return processSingleThreaded(file);
 
