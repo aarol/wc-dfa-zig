@@ -182,6 +182,7 @@ pub fn main() !void {
 
 const BUF_SIZE = 65536;
 fn processFile(file: *std.fs.File) !Result {
+    // const num_cpu = 1;
     const num_cpu = std.Thread.getCpuCount() catch 1;
 
     if (num_cpu == 1) return processSingleThreaded(file);
@@ -257,11 +258,9 @@ fn processFile(file: *std.fs.File) !Result {
         }
 
         // ── Stage 2: Chain ────────────────────────────────────────────────────────
-        // If the next slot to chain has finished its end-state calculation, resolve
-        // the actual start state (using the chained end state from the previous slot)
-        // and dispatch the count task. This must run in order so the start-state
-        // chain stays consistent.
-        if (chain_cursor < fill_cursor) {
+        // Chain as many ready slots as possible before draining so we can enqueue
+        // a full batch of count tasks and keep workers busy.
+        while (chain_cursor < fill_cursor) {
             const idx = chain_cursor % num_cpu;
             const slot = &slots[idx];
 
@@ -289,9 +288,11 @@ fn processFile(file: *std.fs.File) !Result {
         }
 
         // ── Stage 3: Drain ────────────────────────────────────────────────────────
-        // If the oldest in-flight count task is done, accumulate its result and
-        // free the slot for the fill stage.
-        if (drain_cursor < chain_cursor) {
+        // Only block on draining when we must free a slot (ring full) or when
+        // finishing remaining work after EOF.
+        const ring_full = fill_cursor - drain_cursor == num_cpu;
+        const flushing_eof = eof and drain_cursor < fill_cursor;
+        if ((ring_full or flushing_eof) and drain_cursor < chain_cursor) {
             const idx = drain_cursor % num_cpu;
             const slot = &slots[idx];
 
