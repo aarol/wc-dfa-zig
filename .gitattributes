@@ -1,1 +1,2 @@
 zhwiki-latest-all-titles filter=lfs diff=lfs merge=lfs -text
+utf8.txt filter=lfs diff=lfs merge=lfs -text
