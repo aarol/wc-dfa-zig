@@ -54,7 +54,7 @@ fn gen_char_type_table() [256]u8 {
     return column;
 }
 
-pub fn wc_dfa(reader: *std.Io.Reader) Result {
+pub fn wc_simple(reader: *std.Io.Reader) Result {
     const table = gen_transition_table();
     const column = gen_char_type_table();
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const parg = @import("parg");
 const dfa = @import("dfa.zig");
 const parallel = @import("parallel.zig");
+const build_options = @import("build_options");
 
 const Opts = packed struct {
     count_lines: bool = false,
@@ -13,7 +14,7 @@ const Opts = packed struct {
 pub fn main() !void {
     var opts = Opts{};
 
-    var total = dfa.Result{};
+    const allocator = std.heap.page_allocator;
 
     const it = std.process.args();
     var p = parg.parse(it, .{});
@@ -22,6 +23,7 @@ pub fn main() !void {
     _ = p.nextValue();
 
     var files_processed: usize = 0;
+    var total = dfa.Result{};
 
     while (p.next()) |token| {
         switch (token) {
@@ -52,7 +54,7 @@ pub fn main() !void {
                 }
                 var file = try std.fs.cwd().openFile(arg, .{ .mode = .read_only });
                 defer file.close();
-                const res = try processFile(&file);
+                const res = try processFile(&file, allocator);
                 try printResult(opts, arg, res);
                 total.line_count += res.line_count;
                 total.word_count += res.word_count;
@@ -68,7 +70,7 @@ pub fn main() !void {
 
     if (files_processed == 0) {
         var stdin_file = std.fs.File.stdin();
-        const res = try processFile(&stdin_file);
+        const res = try processFile(&stdin_file, allocator);
         try printResult(opts, "", res);
         total.line_count += res.line_count;
         total.word_count += res.word_count;
@@ -84,14 +86,14 @@ pub fn main() !void {
 
 const BUF_SIZE = 65536;
 
-fn processFile(file: *std.fs.File) !dfa.Result {
+fn processFile(file: *std.fs.File, allocator: std.mem.Allocator) !dfa.Result {
     var buf: [BUF_SIZE]u8 = undefined;
     var file_reader = file.reader(&buf);
     const reader = &file_reader.interface;
 
-    const num_cpu = std.Thread.getCpuCount() catch 1;
+    const num_cpu = build_options.num_cpu orelse (std.Thread.getCpuCount() catch 1);
     if (num_cpu == 1) return dfa.wc_dfa(reader);
-    return parallel.processParallel(reader);
+    return parallel.processParallel(reader, allocator, num_cpu);
 }
 
 fn printResult(opts: Opts, file: []const u8, result: dfa.Result) !void {
@@ -117,7 +119,7 @@ fn printResult(opts: Opts, file: []const u8, result: dfa.Result) !void {
 test "wc_dfa counts correctly" {
     const input = "Hello, 世界!\nThis is a test.\n";
     var reader = std.io.Reader.fixed(input);
-    const result = try dfa.wc_dfa(&reader);
+    const result = dfa.wc_dfa(&reader);
     try std.testing.expectEqual(2, result.line_count);
     try std.testing.expectEqual(6, result.word_count);
     try std.testing.expectEqual(31, result.byte_count);
@@ -139,10 +141,12 @@ test "parallel matches wc_dfa" {
     }
     var reader = std.io.Reader.fixed(data);
 
-    const parallel_result = try parallel.processParallel(&reader);
+    const num_cpu = std.Thread.getCpuCount() catch 1;
+
+    const parallel_result = try parallel.processParallel(&reader, std.testing.allocator, num_cpu);
 
     reader = std.io.Reader.fixed(data);
-    const expected = try dfa.wc_dfa(&reader);
+    const expected = dfa.wc_dfa(&reader);
 
     try std.testing.expectEqual(expected.line_count, parallel_result.line_count);
     try std.testing.expectEqual(expected.word_count, parallel_result.word_count);
@@ -154,16 +158,22 @@ test "fuzz parallel" {
     const Context = struct {};
     const global = struct {
         fn testOne(_: Context, input: []const u8) anyerror!void {
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
+            // const num_chars = std.unicode.utf8CountCodepoints(input) catch return;
+
             var reader = std.io.Reader.fixed(input);
-            const parallel_result = try parallel.processParallel(&reader);
+            const parallel_result = try parallel.processParallel(&reader, std.testing.allocator, std.Thread.getCpuCount() catch 1);
             reader = std.io.Reader.fixed(input);
-            const expected = try dfa.wc_dfa(&reader);
+            const expected = dfa.wc_dfa(&reader);
+            // try std.testing.expectEqual(num_chars, expected.char_count);
             try std.testing.expectEqual(expected.line_count, parallel_result.line_count);
             try std.testing.expectEqual(expected.word_count, parallel_result.word_count);
             try std.testing.expectEqual(expected.byte_count, parallel_result.byte_count);
             try std.testing.expectEqual(expected.char_count, parallel_result.char_count);
         }
     };
-    try std.testing.fuzz(Context{}, global.testOne, .{});
+    const file = try std.fs.cwd().readFileAlloc(std.testing.allocator, "utf8.txt", 200 * 1024 * 1024 * 1024);
+    defer std.testing.allocator.free(file);
+    try std.testing.fuzz(Context{}, global.testOne, .{ .corpus = &.{
+        file,
+    } });
 }

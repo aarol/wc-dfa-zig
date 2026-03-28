@@ -2,3 +2,4 @@ zig-out
 .zig-cache
 *.pdf
 *-wc
+utf8.txt

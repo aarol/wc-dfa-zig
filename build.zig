@@ -16,6 +16,8 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
+    const num_cpu = b.option(usize, "ncpu", "Run in single thread mode for testing and benchmarking purposes");
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -40,6 +42,7 @@ pub fn build(b: *std.Build) void {
 
     const parg = b.dependency("parg", .{});
     const parg_module = parg.module("parg");
+
     const exe = b.addExecutable(.{
         .name = "wc",
         .root_module = b.createModule(.{
@@ -61,6 +64,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    const options = b.addOptions();
+    options.addOption(?usize, "num_cpu", num_cpu);
+    exe.root_module.addOptions("build_options", options);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -113,6 +120,7 @@ pub fn build(b: *std.Build) void {
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .use_llvm = true,
     });
 
     // A run step that will run the second test executable.

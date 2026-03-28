@@ -41,17 +41,10 @@ fn countWorker(task: CountTask) void {
     task.results_ptr.byte_count = byte_count;
 }
 
-pub fn processParallel(reader: *std.Io.Reader) !dfa.Result {
-    const num_cpu = std.Thread.getCpuCount() catch 1;
-    // const num_cpu = 1;
-
+pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num_cpu: usize) !dfa.Result {
     var thread_pool: std.Thread.Pool = undefined;
-    try thread_pool.init(.{ .allocator = std.heap.page_allocator });
+    try thread_pool.init(.{ .allocator = allocator, .n_jobs = num_cpu });
     defer thread_pool.deinit();
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
     // List to store chunks and their results
     var chunks = try allocator.alloc(ChunkData, num_cpu);
@@ -81,7 +74,7 @@ pub fn processParallel(reader: *std.Io.Reader) !dfa.Result {
                 continue;
             }
 
-            const overflow = lastIndexUtf8Overflow(chunk.buffer[0..bytes_read]);
+            const last_char_len, const overflow = lastCharLenAndOverflow(chunk.buffer[0..bytes_read]);
             if (overflow != 0) {
                 // Read the overflow bytes to ensure we don't split a UTF-8 character
                 bytes_read += try reader.readSliceShort(chunk.buffer[bytes_read .. bytes_read + overflow]);
@@ -100,7 +93,7 @@ pub fn processParallel(reader: *std.Io.Reader) !dfa.Result {
             try thread_pool.spawn(countWorker, .{task});
 
             // For the next chunk, determine the starting state based on the last character of the current chunk
-            const last_char = std.unicode.utf8Decode(chunk.buffer[(bytes_read - overflow - 1)..bytes_read]) catch 0;
+            const last_char = std.unicode.utf8Decode(chunk.buffer[(chunk.size - last_char_len)..chunk.size]) catch 0;
             if (dfa.isWhitespace(last_char)) {
                 prev_state = dfa.State.WASSPACE;
             } else {
@@ -130,24 +123,24 @@ pub fn processParallel(reader: *std.Io.Reader) !dfa.Result {
     return total;
 }
 
-// Calculates how many bytes the last UTF-8 character overflows the buffer, assuming that it is valid UTF-8.
-fn lastIndexUtf8Overflow(buffer: []const u8) usize {
+// Calculates the length of the last UTF-8 character and any how many bytes it overflows the buffer.
+fn lastCharLenAndOverflow(buffer: []const u8) struct { usize, usize } {
     const last_idx = buffer.len - 1;
     for (0..4) |i| {
         const byte = buffer[last_idx - i];
         const blen = std.unicode.utf8ByteSequenceLength(byte) catch {
             continue;
         };
-        return blen - i - 1;
+        return .{ blen, blen - i - 1 };
     }
-    return 0;
+    return .{ 0, 0 };
 }
 
 test "lastIndexUtf8Overflow" {
     var input = "Tent ⛺";
     const len = input.len;
-    try std.testing.expectEqual(0, lastIndexUtf8Overflow(input[0..len]));
-    try std.testing.expectEqual(1, lastIndexUtf8Overflow(input[0 .. len - 1]));
-    try std.testing.expectEqual(2, lastIndexUtf8Overflow(input[0 .. len - 2]));
-    try std.testing.expectEqual(0, lastIndexUtf8Overflow(input[0 .. len - 3]));
+    try std.testing.expectEqual(.{ 3, 0 }, lastCharLenAndOverflow(input[0..len]));
+    try std.testing.expectEqual(.{ 3, 1 }, lastCharLenAndOverflow(input[0 .. len - 1]));
+    try std.testing.expectEqual(.{ 3, 2 }, lastCharLenAndOverflow(input[0 .. len - 2]));
+    try std.testing.expectEqual(.{ 1, 0 }, lastCharLenAndOverflow(input[0 .. len - 3]));
 }

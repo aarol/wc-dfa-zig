@@ -16,7 +16,7 @@ pub const Result = struct {
     char_count: usize = 0,
 };
 
-pub fn wc_dfa(reader: *std.Io.Reader) !Result {
+pub fn wc_dfa(reader: *std.Io.Reader) Result {
     const table = gen_table();
     var counts = [_]usize{0} ** State.STATE_MAX;
     var state: usize = State.WASSPACE;
