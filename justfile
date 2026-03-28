@@ -1,23 +1,23 @@
 build:
-  zig build --release=fast
+    zig build --release=fast
 
-move-exe target_name:
-  mv ./zig-out/bin/wc {{target_name}}
+build-exe target_name: build
+    mv ./zig-out/bin/wc {{ target_name }}
 
 run: build
-  ./zig-out/bin/wc -lwm zhwiki-latest-all-titles
+    ./zig-out/bin/wc -lwm zhwiki-latest-all-titles
 
 bench: build
-  hyperfine "./zig-out/bin/wc -lwm zhwiki-latest-all-titles"
+    hyperfine "./zig-out/bin/wc -lwm zhwiki-latest-all-titles"
 
-bench_against other: build
-  hyperfine "./zig-out/bin/wc -lwm zhwiki-latest-all-titles" "{{other}} -lwm zhwiki-latest-all-titles"
+bench_against other file="zhwiki-latest-all-titles": build
+    hyperfine "./zig-out/bin/wc -lwm {{ file }}" "{{ other }} -lwm {{ file }}"
 
 test:
-  zig test src/main.zig -lc
+    zig test src/main.zig -lc
 
 bench_simple file: build
-  hyperfine -N --style=color "./dfa-wc {{file}}" "wc {{file}}"
+    hyperfine -N --style=color "./dfa-wc {{ file }}" "wc {{ file }}"
 
 bench_all file: build
-  hyperfine -N --style=color "./parallel-wc -lwc {{file}}" "./sequential-wc -lwc {{file}}" "wc -lwc {{file}}"
+    hyperfine -N --style=color "./parallel-wc -lwc {{ file }}" "./sequential-wc -lwc {{ file }}" "wc -lwc {{ file }}"

@@ -1,7 +1,7 @@
 const std = @import("std");
 const dfa = @import("dfa.zig");
 
-const CHUNK_SIZE = 2_000_000;
+const CHUNK_SIZE = 2_000_003; //3 bytes for UTF-8 overlap
 
 const ChunkData = struct {
     buffer: [CHUNK_SIZE]u8,
@@ -19,47 +19,6 @@ const CountTask = struct {
     wg: *std.Thread.WaitGroup,
     table: *const dfa.Table,
 };
-
-const ChunkProcessingTask = struct {
-    chunk: []const u8,
-    results_ptr: *[32]u8,
-    wg: *std.Thread.WaitGroup,
-    table: *const dfa.CoalescedTable,
-    uniques: *const dfa.Uniques,
-    prev_char: u8,
-};
-
-const S = @Vector(32, u8);
-
-fn gather(slice: S, index: S) S {
-    // This will be optimized to a series of SIMD shuffle instructions
-    var result: [32]u8 = undefined;
-    comptime var vec_i = 0;
-    inline while (vec_i < 32) : (vec_i += 1) {
-        result[vec_i] = slice[index[vec_i]];
-    }
-    return result;
-}
-
-/// From every possible starting state, calculates what the end state would be for the given chunk.
-/// Thanks to range coalescing, there are only 32 possible starting states.
-fn chunkWorker(task: ChunkProcessingTask) void {
-    defer task.wg.finish();
-    var prev_char = task.prev_char;
-
-    var s: S = std.simd.iota(u8, 32);
-
-    for (task.chunk) |b| {
-        const t_active: S = task.table[prev_char][b][0..32].*;
-        s = gather(t_active, s);
-        prev_char = b;
-    }
-
-    const s_local: [32]u8 = s;
-    for (0..32) |i| {
-        task.results_ptr[i] = task.uniques[prev_char][s_local[i]];
-    }
-}
 
 fn countWorker(task: CountTask) void {
     defer task.wg.finish();
@@ -94,55 +53,60 @@ pub fn processParallel(reader: *std.Io.Reader) !dfa.Result {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var prev_chunk_end_state: u8 = dfa.State.WASSPACE;
-
     // List to store chunks and their results
     var chunks = try allocator.alloc(ChunkData, num_cpu);
     defer allocator.free(chunks);
-
-    var states = try allocator.alloc(u8, num_cpu);
-    defer allocator.free(states);
-
-    // Store pointers to heap-allocated result arrays. They will be set to undefined first.
-    var end_state_results = try allocator.alloc([32]u8, num_cpu);
-    defer allocator.free(end_state_results);
 
     var result_counts = try allocator.alloc(dfa.Result, num_cpu);
     defer allocator.free(result_counts);
 
     const table = dfa.gen_table();
-    dfa.build_coalesce_table(&table);
 
     var total = dfa.Result{};
 
     var wg = std.Thread.WaitGroup{};
     var i: usize = 0;
-    var prev_char: u8 = ' ';
+    // var expected_end_state: u8 = dfa.State.WASSPACE;
+    var prev_state: u8 = dfa.State.WASSPACE;
     var incomplete_loop = false;
 
     // Read file into chunks and spawn workers immediately
     while (true) {
         if (i < num_cpu and !incomplete_loop) {
             var chunk = &chunks[i];
-            const bytes_read = try reader.readSliceShort(&chunk.buffer);
-            chunk.size = bytes_read;
+            var bytes_read = try reader.readSliceShort(chunk.buffer[0 .. CHUNK_SIZE - 3]);
 
             if (bytes_read == 0) {
                 incomplete_loop = true;
                 continue;
             }
 
+            const overflow = lastIndexUtf8Overflow(chunk.buffer[0..bytes_read]);
+            if (overflow != 0) {
+                // Read the overflow bytes to ensure we don't split a UTF-8 character
+                bytes_read += try reader.readSliceShort(chunk.buffer[bytes_read .. bytes_read + overflow]);
+            }
+
+            chunk.size = bytes_read;
+
             wg.start();
-            const task = ChunkProcessingTask{
+            const task = CountTask{
                 .chunk = chunk.buffer[0..chunk.size],
-                .results_ptr = &end_state_results[i],
+                .results_ptr = &result_counts[i],
+                .start_state = prev_state,
+                .table = &table,
                 .wg = &wg,
-                .prev_char = prev_char,
-                .table = &dfa.coalesced_table,
-                .uniques = &dfa.uniques,
             };
-            try thread_pool.spawn(chunkWorker, .{task});
-            prev_char = chunk.buffer[chunk.size - 1];
+            try thread_pool.spawn(countWorker, .{task});
+
+            // For the next chunk, determine the starting state based on the last character of the current chunk
+            const last_char = std.unicode.utf8Decode(chunk.buffer[(bytes_read - overflow - 1)..bytes_read]) catch 0;
+            if (dfa.isWhitespace(last_char)) {
+                prev_state = dfa.State.WASSPACE;
+            } else {
+                prev_state = dfa.State.WASWORD;
+            }
+
             i += 1;
         } else {
             // Every thread is busy, wait for them to finish
@@ -151,34 +115,6 @@ pub fn processParallel(reader: *std.Io.Reader) !dfa.Result {
 
             if (i == 0) break;
 
-            // Now we can set the start states for each chunk
-            // based on the end states of the previous chunks
-            states[0] = prev_chunk_end_state;
-            for (1..i) |j| {
-                const prev_ch = chunks[j - 1].lastByte();
-                const local_idx = dfa.global_to_local[prev_ch][states[j - 1]];
-                states[j] = end_state_results[j - 1][local_idx];
-            }
-
-            const final_prev_char = chunks[i - 1].lastByte();
-            const final_local_idx = dfa.global_to_local[final_prev_char][states[i - 1]];
-            prev_chunk_end_state = end_state_results[i - 1][final_local_idx];
-
-            wg.startMany(i);
-            // Now, calculate the results for each chunk with the correct start states
-            for (0..i) |j| {
-                const task = CountTask{
-                    .chunk = chunks[j].buffer[0..chunks[j].size],
-                    .start_state = states[j],
-                    .results_ptr = &result_counts[j],
-                    .wg = &wg,
-                    .table = &table,
-                };
-                try thread_pool.spawn(countWorker, .{task});
-            }
-
-            thread_pool.waitAndWork(&wg);
-
             for (0..i) |j| {
                 total.line_count += result_counts[j].line_count;
                 total.word_count += result_counts[j].word_count;
@@ -186,11 +122,32 @@ pub fn processParallel(reader: *std.Io.Reader) !dfa.Result {
                 total.char_count += result_counts[j].char_count;
             }
 
-            wg.reset();
             i = 0;
             if (incomplete_loop) break;
         }
     }
 
     return total;
+}
+
+// Calculates how many bytes the last UTF-8 character overflows the buffer, assuming that it is valid UTF-8.
+fn lastIndexUtf8Overflow(buffer: []const u8) usize {
+    const last_idx = buffer.len - 1;
+    for (0..4) |i| {
+        const byte = buffer[last_idx - i];
+        const blen = std.unicode.utf8ByteSequenceLength(byte) catch {
+            continue;
+        };
+        return blen - i - 1;
+    }
+    return 0;
+}
+
+test "lastIndexUtf8Overflow" {
+    var input = "Tent ⛺";
+    const len = input.len;
+    try std.testing.expectEqual(0, lastIndexUtf8Overflow(input[0..len]));
+    try std.testing.expectEqual(1, lastIndexUtf8Overflow(input[0 .. len - 1]));
+    try std.testing.expectEqual(2, lastIndexUtf8Overflow(input[0 .. len - 2]));
+    try std.testing.expectEqual(0, lastIndexUtf8Overflow(input[0 .. len - 3]));
 }

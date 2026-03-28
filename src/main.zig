@@ -149,3 +149,21 @@ test "parallel matches wc_dfa" {
     try std.testing.expectEqual(expected.byte_count, parallel_result.byte_count);
     try std.testing.expectEqual(expected.char_count, parallel_result.char_count);
 }
+
+test "fuzz parallel" {
+    const Context = struct {};
+    const global = struct {
+        fn testOne(_: Context, input: []const u8) anyerror!void {
+            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
+            var reader = std.io.Reader.fixed(input);
+            const parallel_result = try parallel.processParallel(&reader);
+            reader = std.io.Reader.fixed(input);
+            const expected = try dfa.wc_dfa(&reader);
+            try std.testing.expectEqual(expected.line_count, parallel_result.line_count);
+            try std.testing.expectEqual(expected.word_count, parallel_result.word_count);
+            try std.testing.expectEqual(expected.byte_count, parallel_result.byte_count);
+            try std.testing.expectEqual(expected.char_count, parallel_result.char_count);
+        }
+    };
+    try std.testing.fuzz(Context{}, global.testOne, .{});
+}

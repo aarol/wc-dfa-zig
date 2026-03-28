@@ -5,6 +5,10 @@ const c = @cImport({
     @cInclude("locale.h");
 });
 
+pub fn isWhitespace(b: c.wint_t) bool {
+    return c.iswspace(b) != 0;
+}
+
 pub const Result = struct {
     line_count: usize = 0,
     word_count: usize = 0,
