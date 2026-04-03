@@ -1,11 +1,6 @@
 const std = @import("std");
 
-const Result = struct {
-    line_count: usize,
-    word_count: usize,
-    char_count: usize,
-    byte_count: usize,
-};
+const Result = @import("dfa.zig").Result;
 
 const State = struct {
     whitespace: usize = 0,
@@ -58,23 +53,18 @@ pub fn wc_simple(reader: *std.Io.Reader) Result {
     const table = gen_transition_table();
     const column = gen_char_type_table();
 
-    var counts = [_]usize{0} ** State.STATE_MAX;
-    var state: usize = State.WASSPACE;
+    var counts = [_]usize{0} ** 4;
+    var state: usize = State.whitespace;
     while (true) {
         const b = reader.takeByte() catch break;
         state = table[state][column[b]];
         counts[state] += 1;
     }
 
-    var byte_count: usize = 0;
-    for (0..State.STATE_MAX) |i| {
-        byte_count += counts[i];
-    }
-
     return .{
-        .line_count = counts[State.NEWLINE],
-        .word_count = counts[State.NEWWORD],
-        .char_count = counts[0] + counts[1] + counts[2] + counts[3],
-        .byte_count = byte_count,
+        .line_count = counts[State.newline],
+        .word_count = counts[State.word],
+        .char_count = 0,
+        .byte_count = counts[0] + counts[1] + counts[2] + counts[3],
     };
 }

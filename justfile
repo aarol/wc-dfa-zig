@@ -19,5 +19,5 @@ test:
 bench_simple file: build
     hyperfine -N --style=color "./dfa-wc {{ file }}" "wc {{ file }}"
 
-bench_all file: build
-    hyperfine -N --style=color "./parallel-wc -lwc {{ file }}" "./sequential-wc -lwc {{ file }}" "wc -lwc {{ file }}"
+bench_all file:
+    hyperfine -N --style=color --warmup 5 "./parallel-wc -lwc {{ file }}" "./sequential-wc -lwc {{ file }}" "wc -lwc {{ file }}" 
