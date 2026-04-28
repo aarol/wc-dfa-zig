@@ -1,14 +1,5 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("wctype.h");
-    @cInclude("locale.h");
-});
-
-pub fn isWhitespace(b: c.wint_t) bool {
-    return c.iswspace(b) != 0;
-}
-
 pub const Result = struct {
     line_count: usize = 0,
     word_count: usize = 0,
@@ -86,7 +77,6 @@ pub const State = struct {
 }{};
 
 pub fn gen_table() [State.STATE_MAX][256]u8 {
-    _ = c.setlocale(c.LC_ALL, "");
     var table: [State.STATE_MAX][256]u8 = undefined;
     // Row, base state, word state
     // In WASSPACE and NEWLINE states, non-whitespace ASCII goes to NEWWORD
@@ -110,36 +100,36 @@ pub fn build_first_byte_states(row: *[256]u8, base_state: u8, word_state: u8) vo
             if ((b & 0xE0) == 0xC0) {
                 // 110x xxxx - unicode 2 byte sequence
                 if (b < 0xC2) {
-                    row[b] = base_state + @as(u8, Utf8State.ILLEGAL);
+                    row[b] = base_state + Utf8State.ILLEGAL;
                 } else if (b == 0xC2) {
-                    row[b] = base_state + @as(u8, Utf8State.DUO2_C2);
+                    row[b] = base_state + Utf8State.DUO2_C2;
                 } else {
-                    row[b] = base_state + @as(u8, Utf8State.DUO2_xx);
+                    row[b] = base_state + Utf8State.DUO2_xx;
                 }
             } else if ((b & 0xF0) == 0xE0) {
                 // 1110 xxxx - unicode 3 byte sequence
                 switch (b) {
-                    0xE0 => row[b] = base_state + @as(u8, Utf8State.TRI2_E0),
-                    0xE1 => row[b] = base_state + @as(u8, Utf8State.TRI2_E1),
-                    0xE2 => row[b] = base_state + @as(u8, Utf8State.TRI2_E2),
-                    0xE3 => row[b] = base_state + @as(u8, Utf8State.TRI2_E3),
-                    0xED => row[b] = base_state + @as(u8, Utf8State.TRI2_ED),
-                    0xEE => row[b] = base_state + @as(u8, Utf8State.TRI2_EE),
-                    else => row[b] = base_state + @as(u8, Utf8State.TRI2_xx),
+                    0xE0 => row[b] = base_state + Utf8State.TRI2_E0,
+                    0xE1 => row[b] = base_state + Utf8State.TRI2_E1,
+                    0xE2 => row[b] = base_state + Utf8State.TRI2_E2,
+                    0xE3 => row[b] = base_state + Utf8State.TRI2_E3,
+                    0xED => row[b] = base_state + Utf8State.TRI2_ED,
+                    0xEE => row[b] = base_state + Utf8State.TRI2_EE,
+                    else => row[b] = base_state + Utf8State.TRI2_xx,
                 }
             } else if ((b & 0xF8) == 0xF0) {
                 // 1111 0xxx - unicode 4 byte sequence
                 if (b >= 0xF5) {
-                    row[b] = base_state + @as(u8, Utf8State.ILLEGAL);
+                    row[b] = base_state + Utf8State.ILLEGAL;
                 } else if (b == 0xF0) {
-                    row[b] = base_state + @as(u8, Utf8State.QUAD2_F0);
+                    row[b] = base_state + Utf8State.QUAD2_F0;
                 } else if (b == 0xF4) {
-                    row[b] = base_state + @as(u8, Utf8State.QUAD2_F4);
+                    row[b] = base_state + Utf8State.QUAD2_F4;
                 } else {
-                    row[b] = base_state + @as(u8, Utf8State.QUAD2_xx);
+                    row[b] = base_state + Utf8State.QUAD2_xx;
                 }
             } else {
-                row[b] = base_state + @as(u8, Utf8State.ILLEGAL);
+                row[b] = base_state + Utf8State.ILLEGAL;
             }
             // Unicode 1 byte sequences
         } else if (b == '\n') {
@@ -170,27 +160,23 @@ fn build_utf8_state_row(table: *Table, unicode_base: u8, id: u8, init_next: ?u8)
     }
 
     for (0xC0..0x100) |i| {
-        table[unicode_base + id][i] = unicode_base + @as(u8, Utf8State.ILLEGAL);
+        table[unicode_base + id][i] = unicode_base + Utf8State.ILLEGAL;
     }
 }
 
-/// Builds a state transition table for UTF-8 byte sequence validation.
-/// The DFA tracks:
-/// - UTF-8 multi-byte sequences (2, 3, and 4 byte sequences)
-/// - Word boundaries (whitespace vs non-whitespace)
-/// - Newlines
-/// - Invalid UTF-8 sequences
+/// Adds UTF-8 continuation byte transitions to the table.
 fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
     // Set the illegal state for this unicode base area.
     // This will keep us in the same state if we encounter a malformed UTF-8 sequence.
     // And also act as a "default state" for other states to copy from.
     build_first_byte_states(&table[base_state + Utf8State.ILLEGAL], base_state, word_state);
 
-    // Two byte
+    // Two bytes
+    // `null` for `init_next` means to use the default state, which is to stay in the same unicode state (WASWORD or NEWWORD).
     build_utf8_state_row(table, base_state, Utf8State.DUO2_xx, null);
     build_utf8_state_row(table, base_state, Utf8State.DUO2_C2, null);
 
-    // Three byte
+    // Three bytes
     build_utf8_state_row(table, base_state, Utf8State.TRI2_E0, Utf8State.TRI3_E0_xx);
     build_utf8_state_row(table, base_state, Utf8State.TRI2_E1, Utf8State.TRI3_E1_xx);
     build_utf8_state_row(table, base_state, Utf8State.TRI2_E2, Utf8State.TRI3_E2_xx);
@@ -213,12 +199,12 @@ fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
     build_utf8_state_row(table, base_state, Utf8State.TRI3_xx_xx, null);
 
     table[base_state + Utf8State.TRI2_E1][0x9a] = base_state + Utf8State.TRI3_E1_9a;
-    table[base_state + Utf8State.TRI2_E2][0x80] = base_state + @as(u8, Utf8State.TRI3_E2_80);
-    table[base_state + Utf8State.TRI2_E2][0x81] = base_state + @as(u8, Utf8State.TRI3_E2_81);
-    table[base_state + Utf8State.TRI2_E3][0x80] = base_state + @as(u8, Utf8State.TRI3_E3_80);
-    table[base_state + Utf8State.TRI2_E3][0x81] = base_state + @as(u8, Utf8State.TRI3_E3_81);
+    table[base_state + Utf8State.TRI2_E2][0x80] = base_state + Utf8State.TRI3_E2_80;
+    table[base_state + Utf8State.TRI2_E2][0x81] = base_state + Utf8State.TRI3_E2_81;
+    table[base_state + Utf8State.TRI2_E3][0x80] = base_state + Utf8State.TRI3_E3_80;
+    table[base_state + Utf8State.TRI2_E3][0x81] = base_state + Utf8State.TRI3_E3_81;
 
-    // Four byte
+    // Four bytes
     build_utf8_state_row(table, base_state, Utf8State.QUAD2_xx, Utf8State.QUAD3_xx_xx);
     build_utf8_state_row(table, base_state, Utf8State.QUAD2_F0, Utf8State.QUAD3_F0_xx);
     build_utf8_state_row(table, base_state, Utf8State.QUAD2_F4, Utf8State.QUAD3_F4_xx);
@@ -232,31 +218,24 @@ fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
     build_utf8_state_row(table, base_state, Utf8State.QUAD4_F4_xx_xx, null);
 
     // Mark unicode spaces
-    if (c.iswspace(0x0085) != 0) {
-        table[base_state + Utf8State.DUO2_C2][0x85] = State.WASSPACE;
-    }
-    if (c.iswspace(0x00A0) != 0) {
-        table[base_state + Utf8State.DUO2_C2][0xA0] = State.WASSPACE;
-    }
-    if (c.iswspace(0x1680) != 0) {
-        table[base_state + Utf8State.TRI3_E1_9a][0x80] = State.WASSPACE;
-    }
+
+    // Even though 0x85 (NEXT LINE) is technically a newline,
+    // GNU wc only counts \n as a newline, so we'll follow that convention.
+    table[base_state + Utf8State.DUO2_C2][0x85] = State.WASSPACE;
+
+    table[base_state + Utf8State.DUO2_C2][0xA0] = State.WASSPACE;
+
+    table[base_state + Utf8State.TRI3_E1_9a][0x80] = State.WASSPACE;
+
     for (0x2000..0x200c) |i| {
-        if (c.iswspace(@as(c.wint_t, @intCast(i))) != 0) {
-            table[base_state + Utf8State.TRI3_E2_80][0x80 + (i & 0x6F)] = State.WASSPACE;
-        }
+        table[base_state + Utf8State.TRI3_E2_80][0x80 + (i & 0x6F)] = State.WASSPACE;
     }
 
-    if (c.iswspace(0x2028) != 0)
-        table[base_state + Utf8State.TRI3_E2_80][0xA8] = State.WASSPACE;
-    if (c.iswspace(0x2029) != 0)
-        table[base_state + Utf8State.TRI3_E2_80][0xA9] = State.WASSPACE;
-    if (c.iswspace(0x202F) != 0)
-        table[base_state + Utf8State.TRI3_E2_80][0xAF] = State.WASSPACE;
-    if (c.iswspace(0x205F) != 0)
-        table[base_state + Utf8State.TRI3_E2_81][0x9F] = State.WASSPACE;
-    if (c.iswspace(0x3000) != 0)
-        table[base_state + Utf8State.TRI3_E3_80][0x80] = State.WASSPACE;
+    table[base_state + Utf8State.TRI3_E2_80][0xA8] = State.WASSPACE;
+    table[base_state + Utf8State.TRI3_E2_80][0xA9] = State.WASSPACE;
+    table[base_state + Utf8State.TRI3_E2_80][0xAF] = State.WASSPACE;
+    table[base_state + Utf8State.TRI3_E2_81][0x9F] = State.WASSPACE;
+    table[base_state + Utf8State.TRI3_E3_80][0x80] = State.WASSPACE;
 
     // Mark illegal sequences
 
@@ -265,70 +244,27 @@ fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
     // 0xC0 0x81 is the same as 0x01, so needs to be marked as an
     // illegal sequence
     for (0x80..0xA0) |i| {
-        table[base_state + Utf8State.TRI2_E0][i] = base_state + @as(u8, Utf8State.ILLEGAL);
+        table[base_state + Utf8State.TRI2_E0][i] = base_state + Utf8State.ILLEGAL;
     }
     for (0x80..0x90) |i| {
-        table[base_state + Utf8State.QUAD2_F0][i] = base_state + @as(u8, Utf8State.ILLEGAL);
+        table[base_state + Utf8State.QUAD2_F0][i] = base_state + Utf8State.ILLEGAL;
     }
     // Exceeds max possible size of unicode character
     for (0x90..0xC0) |i| {
-        table[base_state + Utf8State.QUAD2_F4][i] = base_state + @as(u8, Utf8State.ILLEGAL);
+        table[base_state + Utf8State.QUAD2_F4][i] = base_state + Utf8State.ILLEGAL;
     }
     // Surrogate space
     for (0xA0..0xC0) |i| {
-        table[base_state + Utf8State.TRI2_ED][i] = base_state + @as(u8, Utf8State.ILLEGAL);
+        table[base_state + Utf8State.TRI2_ED][i] = base_state + Utf8State.ILLEGAL;
     }
 }
 
-// Range coalescing
-pub const Uniques = [256][32]u8;
-pub const GlobalToLocal = [256][State.STATE_MAX]u8;
-pub const CoalescedTable = [256][256][32]u8;
-
-pub var coalesced_table = std.mem.zeroes(CoalescedTable);
-pub var global_to_local = std.mem.zeroes(GlobalToLocal);
-pub var uniques: Uniques = std.mem.zeroes(Uniques);
-
-pub fn build_coalesce_table(table: *const Table) void {
-    var unique_counts = [_]usize{0} ** 256;
-
-    for (0..256) |ch| {
-        for (0..State.STATE_MAX) |s| {
-            const dest = table[s][ch];
-            var found = false;
-            for (uniques[ch]) |existing| {
-                if (existing == dest) {
-                    found = true;
-                }
-            }
-            if (!found) {
-                uniques[ch][unique_counts[ch]] = dest;
-                global_to_local[ch][s] = @intCast(unique_counts[ch]);
-                unique_counts[ch] += 1;
-            }
-        }
-        if (unique_counts[ch] >= 32) {
-            std.debug.print("Too many unique states for byte {d}: {d}\n", .{ ch, unique_counts[ch] });
-        }
+pub fn isWhitespace(table: [State.STATE_MAX][256]u8, cp: u21) bool {
+    var encoded: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(cp, encoded[0..]) catch return false;
+    var state: usize = State.WASWORD;
+    for (encoded[0..len]) |b| {
+        state = table[state][b];
     }
-
-    for (0..256) |prev| {
-        for (0..256) |curr| {
-            for (0..32) |i| {
-                const global_state = uniques[prev][i];
-                const next_global = table[global_state][curr];
-
-                var next_local: isize = -1;
-                for (0..32) |j| {
-                    if (uniques[curr][j] == next_global) {
-                        next_local = @intCast(j);
-                        break;
-                    }
-                }
-                std.debug.assert(next_local != -1);
-
-                coalesced_table[prev][curr][i] = @intCast(next_local);
-            }
-        }
-    }
+    return state == State.WASSPACE or state == State.NEWLINE;
 }

@@ -94,7 +94,7 @@ pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num
 
             // For the next chunk, determine the starting state based on the last character of the current chunk
             const last_char = std.unicode.utf8Decode(chunk.buffer[(chunk.size - last_char_len)..chunk.size]) catch 0;
-            if (dfa.isWhitespace(last_char)) {
+            if (dfa.isWhitespace(table, last_char)) {
                 prev_state = dfa.State.WASSPACE;
             } else {
                 prev_state = dfa.State.WASWORD;

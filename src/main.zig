@@ -126,6 +126,55 @@ test "wc_dfa counts correctly" {
     try std.testing.expectEqual(27, result.char_count);
 }
 
+test "wc_dfa recognizes unicode whitespace" {
+    const candidates = [_]u21{
+        0x0085, // NEL
+        0x00A0, // NBSP
+        0x1680, // OGHAM SPACE MARK
+        0x2000,
+        0x2001,
+        0x2002,
+        0x2003,
+        0x2004,
+        0x2005,
+        0x2006,
+        0x2007,
+        0x2008,
+        0x2009,
+        0x200A,
+        0x2028, // LINE SEPARATOR
+        0x2029, // PARAGRAPH SEPARATOR
+        0x202F, // NARROW NO-BREAK SPACE
+        0x205F, // MEDIUM MATHEMATICAL SPACE
+        0x3000, // IDEOGRAPHIC SPACE
+    };
+
+    var checked: usize = 0;
+    for (candidates) |cp| {
+        checked += 1;
+
+        var ws_buf: [4]u8 = undefined;
+        const ws_len = try std.unicode.utf8Encode(cp, &ws_buf);
+
+        var input_buf: [6]u8 = undefined;
+        input_buf[0] = 'a';
+        @memcpy(input_buf[1 .. 1 + ws_len], ws_buf[0..ws_len]);
+        input_buf[1 + ws_len] = 'b';
+        const input = input_buf[0 .. 2 + ws_len];
+
+        var reader = std.io.Reader.fixed(input);
+        const result = dfa.wc_dfa(&reader);
+
+        std.testing.expectEqual(@as(usize, 2), result.word_count) catch |err| {
+            std.debug.print(
+                "U+{X:0>4}: word_count={d}, expected 2 (DFA failed to split words at this whitespace)\n",
+                .{ cp, result.word_count },
+            );
+            return err;
+        };
+    }
+}
+
 test "parallel matches wc_dfa" {
     const n_repeats = 100000;
     const input =
