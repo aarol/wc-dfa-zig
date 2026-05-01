@@ -259,7 +259,7 @@ fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
     }
 }
 
-pub fn isWhitespace(table: [State.STATE_MAX][256]u8, cp: u21) bool {
+pub fn isWhitespace(table: *const [State.STATE_MAX][256]u8, cp: u21) bool {
     var encoded: [4]u8 = undefined;
     const len = std.unicode.utf8Encode(cp, encoded[0..]) catch return false;
     var state: usize = State.WASWORD;
