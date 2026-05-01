@@ -11,7 +11,7 @@ bench: build
     hyperfine "./zig-out/bin/wc -lwm zhwiki-latest-all-titles"
 
 bench_against other file="zhwiki-latest-all-titles": build
-    hyperfine "./zig-out/bin/wc -lwm {{ file }}" "{{ other }} -lwm {{ file }}"
+    hyperfine  -N --style=color --warmup=5 "./zig-out/bin/wc {{ file }}" "{{ other }} {{ file }}"
 
 test:
     zig test src/main.zig -lc
