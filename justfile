@@ -1,7 +1,7 @@
-build:
-    zig build --release=fast
+build flags="":
+    zig build --release=fast {{ flags }}
 
-build-exe target_name: build
+build-exe target_name flags="": (build flags)
     mv ./zig-out/bin/wc {{ target_name }}
 
 run: build
@@ -20,4 +20,4 @@ bench_simple file: build
     hyperfine -N --style=color "./dfa-wc {{ file }}" "wc {{ file }}"
 
 bench_all file:
-    hyperfine -N --style=color --warmup 5 "./parallel-wc -lwc {{ file }}" "./sequential-wc -lwc {{ file }}" "wc -lwc {{ file }}" 
+    hyperfine -N --style=color --warmup 5 "./parallel-wc {{ file }}" "./sequential-wc {{ file }}" "wc {{ file }}" 

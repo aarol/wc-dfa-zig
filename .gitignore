@@ -3,3 +3,5 @@ zig-out
 *.pdf
 *-wc
 utf8.txt
+*.ansi
+*.html

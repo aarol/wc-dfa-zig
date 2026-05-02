@@ -1,10 +1,10 @@
-# wc in Zig
+# wc-dfa-zig
 
-A highly optimized `wc` implementation in Zig, 3-6x faster than GNU `wc`.
+A highly optimized `wc` implementation in Zig, 4-16x faster than GNU `wc`. It achieves this by using a finite-state machine to process UTF-8 text byte-by-byte at constant speed without branching, and by implementing data parallelism to distribute the work across multiple CPU cores.
 
-This is not intended as a replacement for the GNU or BSD `wc` program. For example, `--max-line-length`, which prints the maximum display width, is not implemented.
+This is not intended as a complete replacement for the GNU or BSD `wc` programs. For example, the `--max-line-length` flag is not implemented. Additionally, it only supports ASCII and UTF-8 text, not UTF-16 or UTF-32.
 
-Instead, this is intended as a demonstration of how to implement a high-performance `wc` program using finite-state machines and data parallelism.
+If you find yourself needing to count the number of words in gigabytes of UTF-8 text, this program may be of use to you. Otherwise, it is just a fun exercise in optimization.
 
 This program is built on [Robert Graham's wc2](https://github.com/robertdavidgraham/wc2/) program. It uses a finite-state-machine which processes UTF-8 text byte-by-byte at constant speed without any branching.
 
@@ -21,7 +21,7 @@ while (true) {
 }
 ```
 
-Additionally, this program implements the paper [Data-Parallel Finite-State Machines](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/asplos302-mytkowicz.pdf), which further **doubles** the speed of processing large files by processing many chunks in parallel.
+Additionally, this program implements parallellism in [parallel.zig](src/parallel.zig) to distribute the work onto many cores, further \*quadrupling\* the speed of processing large files.
 
 ---
 
@@ -31,7 +31,7 @@ For the UTF-8 version of the state machine, see [dfa.zig](./src/dfa.zig).
 
 For the parallel version, see [parallel.zig](./src/parallel.zig).
 
-## Benchmarks
+<!-- ## Benchmarks
 
 Here are some benchmarks from the english and chinese wikipedia title dumps, which are 165MB text files with lots of words and lines. The `-lwm` flags tell the programs to count lines, words, and multibyte characters. 
 
@@ -59,4 +59,4 @@ And here is the last benchmark with default `wc` flags (lines, words, bytes) and
 
 See the [justfile](./justfile) for testing the benchmarks yourself.
 
-Tested on an AMD Ryzen 5 3600X 6-Core Processor in WSL (Windows Subsystem for Linux).
+Tested on an AMD Ryzen 5 3600X 6-Core Processor in WSL (Windows Subsystem for Linux). -->
