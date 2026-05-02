@@ -227,7 +227,7 @@ fn build_unicode(table: *Table, base_state: u8, word_state: u8) void {
 
     table[base_state + Utf8State.TRI3_E1_9a][0x80] = State.WASSPACE;
 
-    for (0x2000..0x200c) |i| {
+    for (0x2000..0x200b) |i| {
         table[base_state + Utf8State.TRI3_E2_80][0x80 + (i & 0x6F)] = State.WASSPACE;
     }
 
