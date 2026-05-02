@@ -6,10 +6,6 @@ const CHUNK_SIZE = 2_000_003; // 2 MB + 3 bytes for UTF-8 overlap
 const ChunkData = struct {
     buffer: [CHUNK_SIZE]u8,
     size: usize,
-
-    fn lastByte(self: Task) u8 {
-        return self.buffer[self.size - 1];
-    }
 };
 
 const WorkerParams = struct {
@@ -160,6 +156,7 @@ const TaskQueue = struct {
 
     items_sem: std.Thread.Semaphore,
     spaces_sem: std.Thread.Semaphore,
+    push_mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
         return Self{
@@ -172,6 +169,8 @@ const TaskQueue = struct {
 
     pub fn push(self: *Self, task: Task) void {
         self.spaces_sem.wait();
+        self.push_mutex.lock();
+        defer self.push_mutex.unlock();
         const w = self.write_idx.fetchAdd(1, .monotonic);
         self.buffer[w % self.buffer.len] = task;
         self.items_sem.post();
