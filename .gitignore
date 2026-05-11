@@ -5,3 +5,4 @@ zig-out
 utf8.txt
 *.ansi
 *.html
+zig-pkg

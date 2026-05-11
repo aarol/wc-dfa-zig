@@ -9,10 +9,10 @@ const ChunkData = struct {
 };
 
 const WorkerParams = struct {
+    io: std.Io,
     item_queue: *TaskQueue,
     free_queue: *TaskQueue,
     results_ptr: *dfa.Result,
-    result_wg: *std.Thread.WaitGroup,
 };
 
 const Task = struct {
@@ -21,17 +21,17 @@ const Task = struct {
     table: *const dfa.Table,
 };
 
-pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num_cpu: usize) !dfa.Result {
-    var thread_pool: std.Thread.Pool = undefined;
-    try thread_pool.init(.{ .allocator = allocator, .n_jobs = num_cpu });
-    defer thread_pool.deinit();
-
+pub fn processParallel(io: std.Io, reader: *std.Io.Reader, allocator: std.mem.Allocator, num_cpu: usize) !dfa.Result {
     // List to store chunks and their results
     const chunks = try allocator.alloc(ChunkData, num_cpu);
     defer allocator.free(chunks);
 
     var result_counts = try allocator.alloc(dfa.Result, num_cpu);
     defer allocator.free(result_counts);
+    for (result_counts) |*r| r.* = dfa.Result{};
+
+    const threads = try allocator.alloc(std.Thread, num_cpu);
+    defer allocator.free(threads);
 
     const table = dfa.gen_table();
 
@@ -39,22 +39,26 @@ pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num
     defer item_queue.deinit();
     var free_queue = try TaskQueue.init(allocator, num_cpu);
     defer free_queue.deinit();
-    var result_wg = std.Thread.WaitGroup{};
-    result_wg.startMany(num_cpu);
+
+    var spawned: usize = 0;
+    errdefer {
+        for (0..spawned) |i| threads[i].join();
+    }
 
     for (0..num_cpu) |i| {
-        free_queue.push(Task{
+        free_queue.push(io, Task{
             .chunk = &chunks[i],
             .table = &table,
             .start_state = 0,
         });
 
-        try thread_pool.spawn(worker, .{WorkerParams{
+        threads[i] = try std.Thread.spawn(.{}, worker, .{WorkerParams{
+            .io = io,
             .item_queue = &item_queue,
             .free_queue = &free_queue,
             .results_ptr = &result_counts[i],
-            .result_wg = &result_wg,
         }});
+        spawned += 1;
     }
 
     var num_bytes: usize = 0;
@@ -62,10 +66,12 @@ pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num
 
     // Read file into chunks and spawn workers immediately
     while (true) {
-        var task = free_queue.pop();
+        var task = free_queue.pop(io);
         var bytes_read = try reader.readSliceShort(task.chunk.?.buffer[0 .. CHUNK_SIZE - 3]);
 
         if (bytes_read == 0) {
+            // Return the unused chunk so finish() can post the sentinel properly.
+            free_queue.push(io, task);
             break;
         }
 
@@ -80,7 +86,7 @@ pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num
 
         task.start_state = start_state;
 
-        item_queue.push(task);
+        item_queue.push(io, task);
 
         // For the next chunk, determine the starting state based on the last character of the current chunk
         const last_char = std.unicode.utf8Decode(task.chunk.?.buffer[(task.chunk.?.size - last_char_len)..task.chunk.?.size]) catch 0;
@@ -91,9 +97,9 @@ pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num
         }
     }
 
-    item_queue.finish(); // Signal workers to finish after all tasks are enqueued
+    item_queue.finish(io); // Signal workers to finish after all tasks are enqueued
 
-    result_wg.wait(); // Wait for all workers to finish processing
+    for (threads) |t| t.join();
 
     var total = dfa.Result{};
     for (result_counts) |res| {
@@ -107,11 +113,9 @@ pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num
 }
 
 fn worker(params: WorkerParams) void {
-    defer params.result_wg.finish();
-
     var counts = [_]usize{0} ** dfa.State.STATE_MAX;
     while (true) {
-        const task = params.item_queue.pop();
+        const task = params.item_queue.pop(params.io);
         if (task.chunk == null) {
             break; // No more tasks, exit worker
         }
@@ -121,7 +125,7 @@ fn worker(params: WorkerParams) void {
             state = task.table[state][b];
             counts[state] += 1;
         }
-        params.free_queue.push(task);
+        params.free_queue.push(params.io, task);
     }
 
     params.results_ptr.* = dfa.Result{
@@ -152,46 +156,46 @@ const TaskQueue = struct {
     write_idx: std.atomic.Value(usize) = .init(0),
     read_idx: std.atomic.Value(usize) = .init(0),
 
-    items_sem: std.Thread.Semaphore,
-    spaces_sem: std.Thread.Semaphore,
-    push_mutex: std.Thread.Mutex = .{},
+    items_sem: std.Io.Semaphore,
+    spaces_sem: std.Io.Semaphore,
+    push_mutex: std.Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
         return Self{
             .allocator = allocator,
             .buffer = try allocator.alloc(Task, capacity),
-            .items_sem = std.Thread.Semaphore{ .permits = 0 },
-            .spaces_sem = std.Thread.Semaphore{ .permits = capacity },
+            .items_sem = .{ .permits = 0 },
+            .spaces_sem = .{ .permits = capacity },
         };
     }
 
-    pub fn push(self: *Self, task: Task) void {
-        self.spaces_sem.wait();
-        self.push_mutex.lock();
-        defer self.push_mutex.unlock();
+    pub fn push(self: *Self, io: std.Io, task: Task) void {
+        self.spaces_sem.waitUncancelable(io);
+        self.push_mutex.lockUncancelable(io);
+        defer self.push_mutex.unlock(io);
         const w = self.write_idx.fetchAdd(1, .monotonic);
         self.buffer[w % self.buffer.len] = task;
-        self.items_sem.post();
+        self.items_sem.post(io);
     }
 
-    pub fn pop(self: *Self) Task {
+    pub fn pop(self: *Self, io: std.Io) Task {
         while (true) {
-            self.items_sem.wait();
+            self.items_sem.waitUncancelable(io);
             const r = self.read_idx.load(.monotonic);
             // Try to claim the index
             if (self.read_idx.cmpxchgWeak(r, r + 1, .acquire, .monotonic)) |_| {
-                self.items_sem.post(); // Lost race, put permit back
+                self.items_sem.post(io); // Lost race, put permit back
                 continue;
             }
             const task = self.buffer[r % self.buffer.len];
-            self.spaces_sem.post();
+            self.spaces_sem.post(io);
             return task;
         }
     }
 
-    pub fn finish(self: *Self) void {
+    pub fn finish(self: *Self, io: std.Io) void {
         for (0..self.buffer.len) |_| {
-            self.push(Task{
+            self.push(io, Task{
                 .chunk = null,
                 .start_state = 0,
                 .table = undefined,
