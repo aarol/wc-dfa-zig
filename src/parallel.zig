@@ -1,7 +1,7 @@
 const std = @import("std");
 const dfa = @import("dfa.zig");
 
-const CHUNK_SIZE = 2_000_003; // 2 MB + 3 bytes for UTF-8 overlap
+const CHUNK_SIZE = std.math.pow(usize, 2, 20); // 1 MiB
 
 const ChunkData = struct {
     buffer: [CHUNK_SIZE]u8,
@@ -40,6 +40,7 @@ pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num
     var free_queue = try TaskQueue.init(allocator, num_cpu);
     defer free_queue.deinit();
     var result_wg = std.Thread.WaitGroup{};
+    result_wg.startMany(num_cpu);
 
     for (0..num_cpu) |i| {
         free_queue.push(Task{
@@ -89,7 +90,6 @@ pub fn processParallel(reader: *std.Io.Reader, allocator: std.mem.Allocator, num
             start_state = dfa.State.WASWORD;
         }
     }
-    result_wg.startMany(num_cpu);
 
     item_queue.finish(); // Signal workers to finish after all tasks are enqueued
 
@@ -145,14 +145,12 @@ fn lastCharLenAndOverflow(buffer: []const u8) struct { usize, usize } {
     return .{ 0, 0 };
 }
 
-const atomic = std.atomic;
-
 const TaskQueue = struct {
     const Self = @This();
     buffer: []Task,
     allocator: std.mem.Allocator,
-    write_idx: atomic.Value(usize) = .init(0),
-    read_idx: atomic.Value(usize) = .init(0),
+    write_idx: std.atomic.Value(usize) = .init(0),
+    read_idx: std.atomic.Value(usize) = .init(0),
 
     items_sem: std.Thread.Semaphore,
     spaces_sem: std.Thread.Semaphore,

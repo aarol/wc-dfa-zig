@@ -7,8 +7,8 @@ build-exe target_name flags="": (build flags)
 run: build
     ./zig-out/bin/wc -lwm zhwiki-latest-all-titles
 
-bench: build
-    hyperfine "./zig-out/bin/wc -lwm zhwiki-latest-all-titles"
+bench flags="-lwm" file="zhwiki-latest-all-titles": build
+    hyperfine -N "./zig-out/bin/wc {{ flags }} {{ file }}"
 
 bench_against other file="zhwiki-latest-all-titles": build
     hyperfine  -N --style=color --warmup=5 "./zig-out/bin/wc {{ file }}" "{{ other }} {{ file }}"
@@ -20,4 +20,4 @@ bench_simple file: build
     hyperfine -N --style=color "./dfa-wc {{ file }}" "wc {{ file }}"
 
 bench_all file:
-    hyperfine -N --style=color --warmup 5 "./parallel-wc {{ file }}" "./sequential-wc {{ file }}" "wc {{ file }}" 
+    hyperfine -N --style=color --warmup 5 "./parallel-wc {{ file }}" "./sequential-wc {{ file }}" "wc {{ file }}"
