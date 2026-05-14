@@ -1,4 +1,4 @@
-# wc-dfa-zig
+# zwc
 
 A highly optimized `wc` implementation in Zig, 4-16x faster than GNU `wc`. It achieves this by using a finite-state machine to process UTF-8 text byte-by-byte at constant speed without branching, and by implementing data parallelism to distribute the work across multiple CPU cores.
 
